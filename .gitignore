@@ -1,0 +1,9 @@
+# eseguibile compilato: si rigenera con "Ricompila EXE.bat"
+# (per gli utenti finali va pubblicato nelle Release di GitHub)
+SteamImporter.exe
+
+# file temporanei di Windows
+Thumbs.db
+desktop.ini
+*.bak
+*.bak-*

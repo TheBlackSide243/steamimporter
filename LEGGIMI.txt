@@ -1,0 +1,103 @@
+﻿SteamImporter (versione riveduta - cartella "opus")
+===================================================
+LINGUA
+In alto a destra c'e' lo switch ITA | ENG: clicca la lingua che vuoi,
+la scelta viene ricordata al prossimo avvio.
+
+Aspetto rinnovato:
+- barra del titolo scura, in tinta con la finestra
+- ogni app mostra la sua icona nell'elenco
+- caselle di spunta scure disegnate su misura (non piu' bianche)
+- intestazione delle colonne scura, colonna "Tipo" colorata per fonte
+  (Battle.net, Epic, GOG, Ubisoft, UWP, App) e spunta verde per "In Steam"
+- intestazione della finestra con icona e sfumatura viola
+- barra di stato in basso e ultima colonna che riempie la larghezza
+- schede dell'Artwork Manager scure con linguetta attiva viola
+
+Correzioni rispetto alla versione precedente:
+- la finestra "Rimuovi" rilegge l'elenco dopo ogni rimozione (prima, dalla
+  seconda rimozione di seguito, poteva colpire la shortcut sbagliata)
+- "gia' in Steam" e il controllo anti-duplicati usano ora lo stesso criterio:
+  se la spunta viola c'e', l'app non viene riaggiunta nemmeno quando in
+  libreria ha un nome diverso
+- Steam viene chiuso in modo pulito (-shutdown) aspettando che esca davvero,
+  con avviso se e' in corso un gioco, invece di essere terminato a forza
+- i backup vengono ruotati: restano gli ultimi 10
+- "Annulla modifiche" torna indietro di un passo per volta e mostra quanti
+  passi restano
+- alla rimozione vengono cancellate anche le icone scaricate
+- puntatore di attesa durante i download da SteamGridDB
+- gli errori degli scanner vengono mostrati nella barra di stato
+- filtro del menu Start meno aggressivo (non scarta piu' app legittime)
+- i pulsanti si dispongono da soli: aggiungerne altri non richiede piu' di
+  ricalcolare le posizioni a mano
+
+=============
+Aggiunge a Steam le app non-Steam come shortcut, con icona automatica.
+Fonti scansionate automaticamente:
+- Microsoft Store / Xbox / Game Pass (UWP)
+- Battle.net (con avvio diretto verificato per Call of Duty via bootstrapper)
+- Epic Games (lancio via launcher, silenzioso)
+- GOG Galaxy (avvio diretto)
+- Ubisoft Connect (uplay://)
+- Programmi del menu Start (qualsiasi app win32 installata)
+- Qualsiasi altro .exe col pulsante "Aggiungi .exe..."
+L'account Steam viene mostrato con nome utente e id.
+
+COME SI USA
+1. Doppio click su "SteamImporter.exe": e' AUTONOMO, funziona anche
+   copiato da solo (script e icona sono incorporati dentro l'exe).
+   Se pero' accanto all'exe c'e' SteamImporter.ps1, usa quello: cosi'
+   le modifiche allo script si provano subito senza ricompilare.
+   Dopo aver modificato SteamImporter.ps1, doppio click su
+   "Ricompila EXE.bat" per aggiornare la copia incorporata nell'exe.
+   In alternativa "Avvia SteamImporter.bat" lancia direttamente lo script.
+   Il pulsante blu "Riavvia Steam" chiude e riapre Steam per vedere
+   subito le modifiche alla libreria.
+2. Scegli l'account Steam in alto (proposto quello usato piu' di recente)
+3. Spunta le app da aggiungere (cerca col campo in alto; "Mostra anche app
+   di sistema" per vedere tutto). Doppio click sul nome per rinominare.
+4. Con "Aggiungi .exe..." puoi aggiungere qualsiasi programma normale
+5. (Opzionale) incolla una API key di SteamGridDB
+   (https://www.steamgriddb.com/profile/preferences/api - gratuita) per
+   scaricare anche copertine, hero e logo
+6. Premi "Aggiungi a Steam". Se Steam e' aperto ti chiede di chiuderlo
+   (necessario, altrimenti Steam sovrascrive le modifiche all'uscita)
+7. Riavvia Steam: le app sono in libreria
+
+APP GIA' AGGIUNTE E RIMOZIONE
+La lista principale controlla cosa c'e' gia' su Steam: le app gia'
+presenti hanno la spunta nella colonna "In Steam" e il nome in viola
+(il conteggio e' nella barra in basso). Cambiando account il controllo
+si aggiorna.
+Col pulsante "Rimuovi..." si apre l'elenco delle shortcut non-Steam
+dell'account: se nella lista principale avevi spuntato app gia' in Steam,
+le ritrovi gia' selezionate. Spunta quelle da togliere e premi "Rimuovi
+selezionate": vengono eliminati anche i loro artwork; backup automatico,
+recuperabile col pulsante "Annulla modifiche".
+
+ARTWORK MANAGER (scelta manuale delle immagini)
+Col pulsante "Artwork / Copertine..." si apre una finestra dove:
+- scegli una shortcut gia' aggiunta (elenco a sinistra)
+- viene cercata su SteamGridDB (puoi cambiare il gioco trovato dal menu)
+- se il nome non trova nulla (tipico delle app che non sono giochi), scrivi
+  un altro nome nella barra di ricerca in alto a destra e premi Cerca o
+  Invio: le immagini trovate si applicano comunque alla shortcut scelta
+- nelle schede Copertina / Banner / Hero / Logo / Icona vedi le anteprime:
+  clicca quella che preferisci (bordo blu = selezionata)
+- "Applica selezionate" scarica e installa le immagini scelte;
+  per l'icona serve riscrivere shortcuts.vdf, quindi chiede di chiudere Steam
+Serve la API key di SteamGridDB (viene salvata e ricordata).
+
+NOTE
+- Prima di ogni scrittura viene creato un backup: shortcuts.vdf.bak-DATA
+- I duplicati vengono saltati automaticamente
+- Le app UWP vengono lanciate tramite "explorer.exe shell:AppsFolder\..."
+  (metodo standard): partono da Steam ma l'overlay Steam potrebbe non
+  agganciarsi (limite di Windows per le app UWP, vale anche per UWPHook)
+- Per i giochi Game Pass serve comunque l'app Xbox e l'abbonamento attivo
+- L'icona del pacchetto UWP viene usata anche come copertina se non si
+  usa SteamGridDB
+
+Test rapido da terminale (nessuna modifica a Steam):
+  powershell -ExecutionPolicy Bypass -File SteamImporter.ps1 -SelfTest
