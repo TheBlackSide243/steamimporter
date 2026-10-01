@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # SteamImporter
 
 Add non-Steam apps and games to your Steam library — with icons, artwork and a
@@ -119,17 +121,3 @@ file names (`crc32(exe + name) | 0x80000000`), and drops the images into
 
 MIT — see [LICENSE](LICENSE).
 
----
-
-## In breve (italiano)
-
-SteamImporter aggiunge alla libreria Steam le app che Steam non vede: giochi e
-app del Microsoft Store / Xbox / Game Pass, giochi di Battle.net, Epic, GOG e
-Ubisoft, i programmi del menu Start e qualsiasi `.exe`. Scarica anche
-copertine e artwork da SteamGridDB, con una finestra dedicata per sceglierli a
-mano.
-
-Ogni modifica alla libreria passa da un backup e si può annullare. L'interfaccia
-ha lo switch **ITA | ENG** in alto a destra.
-
-Istruzioni dettagliate in italiano: [LEGGIMI.txt](LEGGIMI.txt).
