@@ -287,6 +287,64 @@ function Get-EpicGames {
     return $res
 }
 
+function Find-SteamCacheImage([string]$SteamPath, [string]$AppId, [string]$Type) {
+    # immagini che Steam stesso tiene in appcache\librarycache (layout nuovo per cartella e vecchio piatto)
+    $cache = Join-Path $SteamPath 'appcache\librarycache'
+    $dir = Join-Path $cache $AppId
+    if ($Type -eq 'cover') {
+        if (Test-Path $dir) {
+            $f = Get-ChildItem $dir -Filter 'library_600x900.jpg' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($f) { return $f.FullName }
+        }
+        $old = Join-Path $cache "$($AppId)_library_600x900.jpg"
+    } else {
+        # l'icona e' il jpg col nome di 40 caratteri esadecimali
+        if (Test-Path $dir) {
+            $f = Get-ChildItem $dir -Filter '*.jpg' -ErrorAction SilentlyContinue |
+                Where-Object { $_.BaseName -match '^[0-9a-f]{40}$' } | Select-Object -First 1
+            if ($f) { return $f.FullName }
+        }
+        $old = Join-Path $cache "$($AppId)_icon.jpg"
+    }
+    if (Test-Path $old) { return $old }
+    return $null
+}
+function Get-SteamGames([string]$SteamPath = (Get-SteamPath)) {
+    # giochi gia' nella libreria Steam: in lista solo per vederli, non si possono aggiungere
+    $res = @()
+    if (-not $SteamPath) { return $res }
+    $libs = @($SteamPath)
+    $lf = Join-Path $SteamPath 'steamapps\libraryfolders.vdf'
+    if (Test-Path $lf) {
+        foreach ($m in [regex]::Matches((Get-Content $lf -Raw -Encoding UTF8), '"path"\s+"([^"]+)"')) {
+            $libs += ($m.Groups[1].Value -replace '\\\\', '\')
+        }
+    }
+    $seen = @{}
+    foreach ($lib in ($libs | Select-Object -Unique)) {
+        $sa = Join-Path $lib 'steamapps'
+        try { if (-not (Test-Path $sa)) { continue } } catch { continue }   # disco scollegato
+        foreach ($f in Get-ChildItem $sa -Filter 'appmanifest_*.acf' -ErrorAction SilentlyContinue) {
+            $t = Get-Content $f.FullName -Raw -Encoding UTF8
+            $id = [regex]::Match($t, '"appid"\s+"(\d+)"').Groups[1].Value
+            $name = [regex]::Match($t, '"name"\s+"([^"]*)"').Groups[1].Value
+            $flags = [regex]::Match($t, '"StateFlags"\s+"(\d+)"').Groups[1].Value
+            $dir = [regex]::Match($t, '"installdir"\s+"([^"]*)"').Groups[1].Value
+            if (-not $id -or -not $name -or $seen[$id]) { continue }
+            # bit 4 = installato (6 e 1030 sono installati con aggiornamento in sospeso)
+            if (-not $flags -or -not ([int]$flags -band 4)) { continue }
+            # componenti di sistema di Steam, non giochi
+            if ($id -eq '228980' -or $name -match '^(Proton|Steam Linux Runtime|Steamworks Common)') { continue }
+            $seen[$id] = $true
+            $icon = Find-SteamCacheImage $SteamPath $id 'icon'
+            $o = New-AppItem $name 'Steam' (Join-Path $sa "common\$dir") $null $null $null $(if ($icon) { $icon } else { '' })
+            $o | Add-Member -NotePropertyName SteamGameId -NotePropertyValue $id
+            $res += $o
+        }
+    }
+    return $res
+}
+
 function Get-GogGames {
     $res = @()
     foreach ($root in 'HKLM:\SOFTWARE\WOW6432Node\GOG.com\Games', 'HKLM:\SOFTWARE\GOG.com\Games') {
@@ -648,6 +706,9 @@ function Stop-SteamGracefully([string]$SteamPath, [int]$TimeoutSec = 20) {
 # ---------------------------------------------------------------- Rilevamento app gia' aggiunte
 function Get-AppLaunchParts($App) {
     # exe e opzioni esattamente come verranno scritti in shortcuts.vdf
+    if ($App.Kind -eq 'Steam') {
+        return @("steam://rungameid/$($App.SteamGameId)", '')
+    }
     if ($App.Kind -eq 'UWP') {
         return @('"C:\WINDOWS\explorer.exe"', "shell:AppsFolder\$($App.Aumid)")
     } elseif ($App.Exe) {
@@ -1551,11 +1612,11 @@ if ($SelfTest) {
     }
 
     # scanner launcher
-    foreach ($scanner in 'Get-BattleNetGames', 'Get-EpicGames', 'Get-GogGames', 'Get-UbisoftGames', 'Get-StartMenuPrograms') {
+    foreach ($scanner in 'Get-BattleNetGames', 'Get-EpicGames', 'Get-GogGames', 'Get-UbisoftGames', 'Get-StartMenuPrograms', 'Get-SteamGames') {
         $found = @(& $scanner)
         $perKind = ($found | Group-Object Kind | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
         Write-Host "$scanner : $($found.Count) ($perKind)"
-        $found | Where-Object { $_.Kind -notin 'App', 'Epic', 'Battle.net' } | ForEach-Object { Write-Host "   * $($_.Name) [$($_.Kind)] Opts=$($_.LaunchOptions)" }
+        $found | Where-Object { $_.Kind -notin 'App', 'Epic', 'Battle.net', 'Steam' } | ForEach-Object { Write-Host "   * $($_.Name) [$($_.Kind)] Opts=$($_.LaunchOptions)" }
         $found | Select-Object -First 3 | ForEach-Object { Write-Host "   - $($_.Name) [$($_.Kind)] Exe=$($_.Exe) Opts=$($_.LaunchOptions)" }
     }
     # account con nomi
@@ -1690,9 +1751,9 @@ $list.LabelEdit = $true
 $list.Location = '16,82'
 $list.Size = New-Object System.Drawing.Size($listW, 426)
 $list.Anchor = 'Top,Bottom,Left,Right'
-[void]$list.Columns.Add('', 290)
-[void]$list.Columns.Add('', 108)
-[void]$list.Columns.Add('', 104)
+[void]$list.Columns.Add('', 270)
+[void]$list.Columns.Add('', 112)
+[void]$list.Columns.Add('', 126)
 [void]$list.Columns.Add('', 240)
 # l'ImageList serve solo a dare spazio: righe alte 30px e 24px riservati all'icona,
 # che poi disegno io a 20px dalle bitmap in $script:iconBmps
@@ -1723,6 +1784,7 @@ $script:KindColor = @{
     'EXE'        = [System.Drawing.Color]::FromArgb(230, 170, 90)
     'Google Play' = [System.Drawing.Color]::FromArgb(120, 210, 150)
     'Launcher'   = [System.Drawing.Color]::FromArgb(240, 140, 120)
+    'Steam'      = [System.Drawing.Color]::FromArgb(102, 192, 244)
 }
 $script:PillFont = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
 
@@ -1730,6 +1792,9 @@ function Get-KindGroup([string]$Kind) {
     if ($Kind -eq 'UWP') { return 'uwp' }
     if ($Kind -in 'App', 'EXE') { return 'apps' }
     return 'games'
+}
+function Test-InSteam($App) {
+    return ([bool]$App.VdfKey -or $App.Kind -eq 'Steam')
 }
 function Test-SystemApp($App) {
     return ($App.Kind -eq 'UWP' -and ($App.Pfn -like 'Microsoft.*' -or $App.Pfn -like 'MicrosoftWindows.*' -or
@@ -1799,15 +1864,17 @@ $script:PaintCell = {
         0 {
             # casella e icona negli stessi punti in cui ListView le cerca al clic
             $ir = $e.Item.GetBounds([System.Windows.Forms.ItemBoundsPortion]::Icon)
-            $chk = if ($e.Item.Checked) { $script:ChkOn } else { $script:ChkOff }
-            $cx = $cell.X + [int][Math]::Max(0, ($ir.Left - $cell.X - 16) / 2)
-            $g.DrawImage($chk, $cx, ($cell.Y + [int](($cell.Height - 16) / 2)), 16, 16)
+            if ($app.Kind -ne 'Steam') {      # i giochi Steam non si spuntano: niente casella
+                $chk = if ($e.Item.Checked) { $script:ChkOn } else { $script:ChkOff }
+                $cx = $cell.X + [int][Math]::Max(0, ($ir.Left - $cell.X - 16) / 2)
+                $g.DrawImage($chk, $cx, ($cell.Y + [int](($cell.Height - 16) / 2)), 16, 16)
+            }
             $idx = Get-AppIconIndex $app
             if ($idx -ge 0) {
                 $g.DrawImage($script:iconBmps[$idx], ($ir.X + [int](($ir.Width - 20) / 2)), ($cell.Y + [int](($cell.Height - 20) / 2)), 20, 20)
             }
             $tr = New-Object System.Drawing.Rectangle(($ir.Right + 4), $cell.Y, [Math]::Max(0, ($cell.Right - $ir.Right - 6)), $cell.Height)
-            $col = if ($app.VdfKey) { $script:Th.InSteam } else { $script:Th.Text }
+            $col = if (Test-InSteam $app) { $script:Th.InSteam } else { $script:Th.Text }
             [System.Windows.Forms.TextRenderer]::DrawText($g, $e.Item.Text, $s.Font, $tr, $col, $flags)
         }
         1 {
@@ -1815,7 +1882,7 @@ $script:PaintCell = {
             Draw-Pill $g ([string]$app.Kind) $script:PillFont $cell $c
         }
         2 {
-            if ($app.VdfKey) { Draw-Pill $g ([string][char]0x2713 + ' ' + (T 'In Steam')) $script:PillFont $cell $script:Th.Ok }
+            if (Test-InSteam $app) { Draw-Pill $g ([string][char]0x2713 + ' ' + (T 'Gia'' in Steam')) $script:PillFont $cell $script:Th.Ok }
         }
         3 {
             # i percorsi lunghi si accorciano nel mezzo, cosi' resta visibile il nome dell'exe
@@ -2049,8 +2116,9 @@ function Update-List {
         $app.SteamAppId = if ($ex) { $ex.AppId } else { $null }
         if (-not $chkAll.Checked -and (Test-SystemApp $app)) { continue }
         if ($f -and $app.Name -notlike "*$f*") { continue }
-        if ($ex) { $inSteamCount++ }
-        if ($chkHide.Checked -and $ex) { continue }
+        $inS = Test-InSteam $app
+        if ($inS) { $inSteamCount++ }
+        if ($chkHide.Checked -and $inS) { continue }
         $grp = Get-KindGroup $app.Kind
         $counts.all++; $counts[$grp]++
         if ($script:KindFilter -ne 'all' -and $grp -ne $script:KindFilter) { continue }
@@ -2061,7 +2129,7 @@ function Update-List {
         $by = switch ($script:SortCol) {
             0 { { $_.Name } }
             1 { { $_.Kind } }
-            2 { { [bool]$_.VdfKey } }
+            2 { { Test-InSteam $_ } }
             default { { [string]$_.Detail } }
         }
         $rows = @($rows | Sort-Object -Property $by -Descending:$script:SortDesc)
@@ -2073,7 +2141,7 @@ function Update-List {
     foreach ($app in $rows) {
         $item = New-Object System.Windows.Forms.ListViewItem([string]$app.Name)
         [void]$item.SubItems.Add([string]$app.Kind)
-        [void]$item.SubItems.Add($(if ($app.VdfKey) { T 'In Steam' } else { '' }))
+        [void]$item.SubItems.Add($(if (Test-InSteam $app) { T 'Gia'' in Steam' } else { '' }))
         [void]$item.SubItems.Add([string]$app.Detail)
         $item.Tag = $app
         $item.Checked = [bool]$app.Selected
@@ -2100,7 +2168,7 @@ function Reload-Apps {
         New-ListApp @{ Name = $_.Name; Kind = 'UWP'; Detail = $_.Aumid; Aumid = $_.Aumid; Pfn = $_.Pfn; InstallDir = $_.InstallDir; ExePath = $null; Exe = $null; StartDir = $null; LaunchOptions = $null; Icon = $null }
     })
     $script:scanErrors = @()
-    foreach ($scanner in 'Get-BattleNetGames', 'Get-EpicGames', 'Get-GogGames', 'Get-UbisoftGames', 'Get-StartMenuPrograms') {
+    foreach ($scanner in 'Get-BattleNetGames', 'Get-EpicGames', 'Get-GogGames', 'Get-UbisoftGames', 'Get-StartMenuPrograms', 'Get-SteamGames') {
         try { $apps += @(& $scanner | ForEach-Object { New-ListApp $_ }) }
         catch { $script:scanErrors += "$($scanner -replace '^Get-|Games$|Programs$', '') ($($_.Exception.Message))" }
     }
@@ -2114,7 +2182,7 @@ function Reload-Apps {
         }
     }
     # i giochi dei launcher prima, poi UWP e app generiche, in ordine alfabetico
-    $order = @{ 'Battle.net' = 0; 'Epic' = 0; 'GOG' = 0; 'Ubisoft' = 0; 'Google Play' = 0; 'Launcher' = 0; 'UWP' = 1; 'App' = 2; 'EXE' = 2 }
+    $order = @{ 'Battle.net' = 0; 'Epic' = 0; 'GOG' = 0; 'Ubisoft' = 0; 'Google Play' = 0; 'Launcher' = 0; 'UWP' = 1; 'App' = 2; 'EXE' = 2; 'Steam' = 3 }
     $script:allApps = @($apps | Sort-Object { $order[$_.Kind] }, Name)
     $script:PrevApp = $null
     Refresh-ExistingMap
@@ -2147,13 +2215,17 @@ function Set-PrevCover($Bmp) {
     $pnlCover.Invalidate()
 }
 function Find-LocalCover($App) {
-    # copertina gia' presente nella cartella grid di Steam (app aggiunta in passato)
-    if ($null -eq $App.SteamAppId -or $cmbAcc.SelectedIndex -lt 0) { return $null }
-    $grid = Join-Path $steamPath "userdata\$($accounts[$cmbAcc.SelectedIndex].Id)\config\grid"
-    foreach ($ext in '.png', '.jpg', '.jpeg') {
-        $p = Join-Path $grid ("{0}p{1}" -f $App.SteamAppId, $ext)
-        if (Test-Path $p) { return $p }
+    # copertina gia' presente in Steam: grid dell'account (anche personalizzata), poi la cache di Steam
+    $id = if ($App.Kind -eq 'Steam') { $App.SteamGameId } else { $App.SteamAppId }
+    if ($null -eq $id) { return $null }
+    if ($cmbAcc.SelectedIndex -ge 0) {
+        $grid = Join-Path $steamPath "userdata\$($accounts[$cmbAcc.SelectedIndex].Id)\config\grid"
+        foreach ($ext in '.png', '.jpg', '.jpeg') {
+            $p = Join-Path $grid ("{0}p{1}" -f $id, $ext)
+            if (Test-Path $p) { return $p }
+        }
     }
+    if ($App.Kind -eq 'Steam') { return (Find-SteamCacheImage $steamPath $id 'cover') }
     return $null
 }
 function Update-Preview {
@@ -2174,8 +2246,9 @@ function Update-Preview {
     }
     $lblPrevName.Text = $app.Name
     $lblPrevName.ForeColor = $script:Th.Text
-    $lblPrevInfo.Text = '{0}  {1}  {2}' -f $app.Kind, [char]0x00B7, $(if ($app.VdfKey) { T 'Gia'' in Steam' } else { T 'Non ancora in Steam' })
-    $lblPrevInfo.ForeColor = if ($app.VdfKey) { $script:Th.Ok } else { $script:Th.Sub }
+    $inS = Test-InSteam $app
+    $lblPrevInfo.Text = '{0}  {1}  {2}' -f $app.Kind, [char]0x00B7, $(if ($inS) { T 'Gia'' in Steam' } else { T 'Non ancora in Steam' })
+    $lblPrevInfo.ForeColor = if ($inS) { $script:Th.Ok } else { $script:Th.Sub }
     $parts = Get-AppLaunchParts $app
     $txtPrevCmd.Text = if ($parts) { ('{0} {1}' -f $parts[0], $parts[1]).Trim() } else { '' }
     $lblPrevCmdCap.Visible = $true; $txtPrevCmd.Visible = $true
@@ -2241,7 +2314,10 @@ $list.Add_MouseDown({
     $hit = $s.HitTest($e.Location)
     $script:SkipCheck = ($e.Clicks -gt 1 -and $hit.Location -ne [System.Windows.Forms.ListViewHitTestLocations]::StateImage)
 })
-$list.Add_ItemCheck({ param($s, $e) if ($script:SkipCheck) { $e.NewValue = $e.CurrentValue } })
+$list.Add_ItemCheck({
+    param($s, $e)
+    if ($script:SkipCheck -or $s.Items[$e.Index].Tag.Kind -eq 'Steam') { $e.NewValue = $e.CurrentValue }
+})
 $list.Add_MouseDoubleClick({
     param($s, $e)
     $hit = $s.HitTest($e.Location)
@@ -2273,7 +2349,7 @@ $btnRefresh.Add_Click({ Reload-Apps })
 $lnkSel.Add_LinkClicked({
     # spunta i giochi visibili che non sono ancora in Steam
     foreach ($it in $list.Items) {
-        if ((Get-KindGroup $it.Tag.Kind) -eq 'games' -and -not $it.Tag.VdfKey) { $it.Checked = $true }
+        if ((Get-KindGroup $it.Tag.Kind) -eq 'games' -and -not (Test-InSteam $it.Tag)) { $it.Checked = $true }
     }
 })
 $lnkNone.Add_LinkClicked({
@@ -2445,7 +2521,7 @@ $btnExe.Add_Click({
 })
 
 $btnExport.Add_Click({
-    $sel = @($script:allApps | Where-Object { $_.Selected })
+    $sel = @($script:allApps | Where-Object { $_.Selected -and $_.Kind -ne 'Steam' })
     if ($sel.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show((T 'Seleziona almeno una app (spunta la casella).'), 'SteamImporter') | Out-Null
         return
