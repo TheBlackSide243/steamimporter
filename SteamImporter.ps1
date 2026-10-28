@@ -72,8 +72,11 @@ function Write-VdfMap([System.IO.BinaryWriter]$bw, $map) {
         $val = $map[$key]
         if ($val -is [System.Collections.IDictionary]) {
             $bw.Write([byte]0); Write-VdfString $bw $key; Write-VdfMap $bw $val
-        } elseif ($val -is [uint32] -or $val -is [int]) {
-            $bw.Write([byte]2); Write-VdfString $bw $key; $bw.Write([uint32]$val)
+        } elseif ($val -is [uint32] -or $val -is [int] -or $val -is [long]) {
+            # tipo 2 = 32 bit: i negativi (es. -1) si scrivono con gli stessi byte di un int32,
+            # invece di far fallire la conversione a uint32
+            $bw.Write([byte]2); Write-VdfString $bw $key
+            if ($val -lt 0) { $bw.Write([int32]$val) } else { $bw.Write([uint32]$val) }
         } else {
             $bw.Write([byte]1); Write-VdfString $bw $key; Write-VdfString $bw ([string]$val)
         }
@@ -87,7 +90,12 @@ function Write-ShortcutsVdf([string]$Path, $Shortcuts) {
     Write-VdfMap $bw $Shortcuts
     $bw.Write([byte]8)   # chiusura mappa radice
     $bw.Flush()
-    [System.IO.File]::WriteAllBytes($Path, $ms.ToArray())
+    # scrittura atomica: file temporaneo accanto al vdf, poi sostituzione in un colpo solo,
+    # cosi' un'interruzione a meta' non lascia mai un shortcuts.vdf troncato
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllBytes($tmp, $ms.ToArray())
+    if (Test-Path $Path) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+    else { [System.IO.File]::Move($tmp, $Path) }
 }
 function New-ShortcutEntry([string]$AppName, [string]$Exe, [string]$StartDir, [string]$LaunchOptions, [string]$Icon) {
     $appid = Get-ShortcutAppId $Exe $AppName
@@ -440,6 +448,17 @@ function Get-SIConfig {
         try { $cfg = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json } catch {}
     }
     if (-not $cfg) { $cfg = [pscustomobject]@{} }
+    # la API key su disco e' cifrata con DPAPI (legata all'utente Windows): la decifro qui
+    # e da qui in poi il resto dello script vede SgdbApiKey in chiaro solo in memoria
+    if ($cfg.PSObject.Properties['SgdbApiKeyDpapi']) {
+        $plain = ''
+        try {
+            $ss = ConvertTo-SecureString ([string]$cfg.SgdbApiKeyDpapi)
+            $plain = (New-Object System.Net.NetworkCredential('', $ss)).Password
+        } catch {}   # file copiato da un altro utente/PC: la chiave va reinserita
+        $cfg.PSObject.Properties.Remove('SgdbApiKeyDpapi')
+        $cfg | Add-Member -NotePropertyName 'SgdbApiKey' -NotePropertyValue $plain -Force
+    }
     # garantisco che le chiavi ci siano sempre, anche con file vecchi
     foreach ($k in @('SgdbApiKey', 'Lang')) {
         if (-not $cfg.PSObject.Properties[$k]) {
@@ -451,7 +470,16 @@ function Get-SIConfig {
 }
 function Save-SIConfig($Config) {
     New-Item -ItemType Directory -Force (Split-Path $script:ConfigPath -Parent) | Out-Null
-    $Config | ConvertTo-Json | Out-File $script:ConfigPath -Encoding utf8
+    # copia da salvare: la chiave in chiaro non tocca mai il disco (le vecchie config
+    # con SgdbApiKey in chiaro vengono migrate al primo salvataggio)
+    $out = $Config.PSObject.Copy()
+    $key = [string]$out.SgdbApiKey
+    $out.PSObject.Properties.Remove('SgdbApiKey')
+    if ($key) {
+        $enc = ConvertTo-SecureString $key -AsPlainText -Force | ConvertFrom-SecureString
+        $out | Add-Member -NotePropertyName 'SgdbApiKeyDpapi' -NotePropertyValue $enc -Force
+    }
+    $out | ConvertTo-Json | Out-File $script:ConfigPath -Encoding utf8
 }
 
 # ---------------------------------------------------------------- SteamGridDB (opzionale)
@@ -678,7 +706,7 @@ function Remove-ShortcutEntries([string]$VdfPath, [string]$GridDir, [string[]]$K
 # ---------------------------------------------------------------- Tema scuro
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-# Palette stile Cherax: nero, viola, bianco
+# Palette: nero, viola, bianco
 $script:Th = @{
     Bg          = [System.Drawing.Color]::FromArgb(15, 15, 17)
     Panel       = [System.Drawing.Color]::FromArgb(28, 28, 32)
@@ -862,8 +890,8 @@ function Style-PrimaryButton([System.Windows.Forms.Button]$Btn) {
         $Btn.Invalidate()
     }
 }
-function Add-CheraxHeader([System.Windows.Forms.Form]$Form, [string]$Title) {
-    # barra del titolo in alto stile Cherax: nero, titolo bianco centrato, riga viola
+function Add-HeaderBar([System.Windows.Forms.Form]$Form, [string]$Title) {
+    # barra del titolo in alto: nero, titolo bianco centrato, riga viola
     $h = 44
     if ($Form.MinimumSize.Height -gt 0) {
         $Form.MinimumSize = New-Object System.Drawing.Size($Form.MinimumSize.Width, ($Form.MinimumSize.Height + $h))
@@ -1208,7 +1236,7 @@ function Show-ArtworkManager([string]$SteamPath, [string]$AccountId, [string]$Ap
     $txtSearch.Left = $btnSearch.Left - 10 - $txtSearch.Width
     $cmbGame.Width = $txtSearch.Left - 12 - $cmbGame.Left
     Hide-ComboArrow $cmbGame
-    Add-CheraxHeader $f 'Artwork Manager'
+    Add-HeaderBar $f 'Artwork Manager'
     Set-AppIcon $f
     Set-DarkTitleBar $f
     $f.Add_Shown({
@@ -1298,7 +1326,7 @@ function Show-RemoveManager([string]$SteamPath, [string]$AccountId, [string[]]$P
 
     $f.Controls.AddRange(@($lbl, $lv, $btnBack, $btnDel))
     Apply-Theme $f
-    Add-CheraxHeader $f (T 'Rimuovi App')
+    Add-HeaderBar $f (T 'Rimuovi App')
     Set-AppIcon $f
     Set-DarkTitleBar $f
     Set-DarkListHeader $lv
@@ -1332,8 +1360,31 @@ if ($SelfTest) {
     if ($back['0']['AppName'] -ne 'Prova App') { throw 'Roundtrip: AppName errato' }
     if ($back['1']['AppName'] -ne 'Àccénti ✓') { throw 'Roundtrip: UTF8 errato' }
     if ($back['0']['appid'] -ne (Get-ShortcutAppId '"C:\WINDOWS\explorer.exe"' 'Prova App')) { throw 'Roundtrip: appid errato' }
+    # seconda scrittura sullo stesso file (ramo File.Replace) con un int negativo
+    $sc['1']['LastPlayTime'] = -1
+    Write-ShortcutsVdf $tmp $sc
+    $back = Read-ShortcutsVdf $tmp
+    if ($back['1']['LastPlayTime'] -ne [uint32]::MaxValue) { throw 'Roundtrip: int negativo errato' }
+    if (Test-Path "$tmp.tmp") { throw 'Scrittura atomica: file .tmp rimasto' }
     Remove-Item $tmp -Force
-    Write-Host 'Roundtrip VDF ok'
+    Write-Host 'Roundtrip VDF ok (anche sovrascrittura atomica e int negativi)'
+
+    # config: la API key su disco deve essere cifrata e tornare uguale in lettura
+    $realCfg = $script:ConfigPath
+    $script:ConfigPath = Join-Path $env:TEMP "si-selftest-$(Get-Random).json"
+    try {
+        $cfg = Get-SIConfig; $cfg.SgdbApiKey = 'chiave-di-prova-123'; Save-SIConfig $cfg
+        if ((Get-Content $script:ConfigPath -Raw) -match 'chiave-di-prova') { throw 'Config: API key in chiaro su disco' }
+        if ((Get-SIConfig).SgdbApiKey -ne 'chiave-di-prova-123') { throw 'Config: API key non decifrata' }
+        '{"SgdbApiKey":"vecchia-in-chiaro","Lang":"en"}' | Out-File $script:ConfigPath -Encoding utf8
+        $old = Get-SIConfig; Save-SIConfig $old
+        if ((Get-Content $script:ConfigPath -Raw) -match 'vecchia-in-chiaro') { throw 'Config: migrazione non avvenuta' }
+        if ((Get-SIConfig).SgdbApiKey -ne 'vecchia-in-chiaro') { throw 'Config: chiave persa nella migrazione' }
+    } finally {
+        Remove-Item $script:ConfigPath -Force -ErrorAction SilentlyContinue
+        $script:ConfigPath = $realCfg
+    }
+    Write-Host 'Config DPAPI ok'
 
     # parsing di uno shortcuts.vdf reale (sola lettura)
     $steamPath = Get-SteamPath
@@ -1831,7 +1882,7 @@ if ($btnSteam.Tag -is [hashtable]) {
 }
 $status.ForeColor = $script:Th.Sub
 Hide-ComboArrow $cmbAcc
-Add-CheraxHeader $form 'SteamImporter'
+Add-HeaderBar $form 'SteamImporter'
 Add-LangSwitch $form
 Set-AppIcon $form
 Set-DarkTitleBar $form
