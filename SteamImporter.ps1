@@ -262,18 +262,28 @@ function Get-EpicGames {
     $res = @()
     $mdir = 'C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests'
     if (-not (Test-Path $mdir)) { return $res }
+    $byApp = [ordered]@{}
     foreach ($f in Get-ChildItem $mdir -Filter '*.item' -ErrorAction SilentlyContinue) {
-        try { $m = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
-        if (-not $m.DisplayName -or -not $m.InstallLocation -or -not (Test-Path $m.InstallLocation)) { continue }
+        # i manifest sono UTF-8 senza BOM: senza -Encoding "LEGO®" diventa "LEGOÂ®"
+        try { $m = Get-Content $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        if (-not $m.DisplayName -or -not $m.InstallLocation) { continue }
         if ($m.bIsIncompleteInstall) { continue }
+        # DLC e contenuti aggiuntivi ("Contenuti di Fortnite...") non si avviano da soli
+        if ($m.bIsApplication -eq $false) { continue }
+        if ($m.MainGameAppName -and $m.MainGameAppName -ne $m.AppName) { continue }
+        try { if (-not (Test-Path $m.InstallLocation)) { continue } } catch { continue }   # disco scollegato
         $gameExe = $null
         if ($m.LaunchExecutable) {
             $p = Join-Path $m.InstallLocation $m.LaunchExecutable
             if (Test-Path $p) { $gameExe = $p }
         }
+        # lo stesso gioco puo' avere piu' manifest (vecchie installazioni): tengo quello con l'exe presente
+        $old = $byApp[$m.AppName]
+        if ($old -and ($old.Icon -or -not $gameExe)) { continue }
         $uri = "com.epicgames.launcher://apps/$($m.AppName)?action=launch&silent=true"
-        $res += New-AppItem $m.DisplayName 'Epic' $m.InstallLocation '"C:\WINDOWS\explorer.exe"' '"C:\WINDOWS"' $uri $(if ($gameExe) { $gameExe } else { '' })
+        $byApp[$m.AppName] = New-AppItem $m.DisplayName 'Epic' $m.InstallLocation '"C:\WINDOWS\explorer.exe"' '"C:\WINDOWS"' $uri $(if ($gameExe) { $gameExe } else { '' })
     }
+    $res = @($byApp.Values)
     return $res
 }
 
@@ -311,20 +321,49 @@ function Get-UbisoftGames {
     return $res
 }
 
+# launcher di giochi riconosciuti dal nome dell'exe: in lista vanno tra i Giochi, non tra le App
+$script:GameLaunchers = @(
+    'prismlauncher.exe', 'multimc.exe', 'polymc.exe', 'atlauncher.exe', 'minecraftlauncher.exe', 'minecraft.exe',
+    'lunar client.exe', 'eadesktop.exe', 'ealauncher.exe', 'upc.exe', 'ubisoftconnect.exe', 'galaxyclient.exe',
+    'epicgameslauncher.exe', 'battle.net launcher.exe', 'battle.net.exe', 'riotclientservices.exe',
+    'amazon games ui.exe', 'itch.exe', 'playnite.desktopapp.exe', 'playnite.fullscreenapp.exe', 'heroic.exe'
+)
+function Get-LnkUrl([string]$Path) {
+    # i collegamenti di Google Play Giochi non puntano a un exe: l'indirizzo di avvio
+    # e' solo dentro il file .lnk (in UTF-16), dove WScript.Shell non lo vede
+    try {
+        $b = [System.IO.File]::ReadAllBytes($Path)
+        $txt = [System.Text.Encoding]::Unicode.GetString($b) + ' ' + [System.Text.Encoding]::ASCII.GetString($b)
+        $m = [regex]::Match($txt, 'googleplaygames://launch/\?[^\x00\s"]+')
+        if ($m.Success) { return $m.Value }
+    } catch {}
+    return $null
+}
 function Get-StartMenuPrograms {
     # Programmi win32 dal menu Start (.lnk) - per giochi/app installati fuori dai launcher
     $res = @()
     $sh = New-Object -ComObject WScript.Shell
     $seen = @{}
     # parole intere, per non scartare app legittime tipo "Updater Pro" o "HelpDesk"
-    $junk = '(^|[\W_])(uninstall|uninstaller|unins\d*|setup|repair|readme|manual|help|guida|documentation|website|sito|update|updates)([\W_]|$)'
+    $junk = '(^|[\W_])(uninstall|uninstaller|unins\d*|disinstalla|disinstallazione|setup|repair|readme|manual|help|guida|documentation|website|sito|update|updates)([\W_]|$)'
     foreach ($dir in "$env:APPDATA\Microsoft\Windows\Start Menu\Programs", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs") {
         if (-not (Test-Path $dir)) { continue }
         foreach ($lnk in Get-ChildItem $dir -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue) {
             if ($lnk.BaseName -match $junk) { continue }
             try { $s = $sh.CreateShortcut($lnk.FullName) } catch { continue }
             $target = $s.TargetPath
-            if (-not $target -or $target -notlike '*.exe' -or -not (Test-Path $target)) { continue }
+            if (-not $target) {
+                $url = Get-LnkUrl $lnk.FullName
+                if ($url -and -not $seen[$url]) {
+                    $seen[$url] = $true
+                    $pkg = if ($url -match '[?&]id=([^&]+)') { $Matches[1] } else { $url }
+                    $ico = ($s.IconLocation -replace ',-?\d+$', '')
+                    if (-not $ico -or -not (Test-Path $ico)) { $ico = '' }
+                    $res += New-AppItem $lnk.BaseName 'Google Play' $pkg '"C:\WINDOWS\explorer.exe"' '"C:\WINDOWS"' $url $ico
+                }
+                continue
+            }
+            if ($target -notlike '*.exe' -or -not (Test-Path $target)) { continue }
             if ($target -like "$env:WINDIR*") { continue }
             if ((Split-Path $target -Leaf) -match $junk) { continue }
             $key = $target.ToLower()
@@ -332,7 +371,12 @@ function Get-StartMenuPrograms {
             $seen[$key] = $true
             $wd = if ($s.WorkingDirectory -and (Test-Path $s.WorkingDirectory)) { $s.WorkingDirectory } else { Split-Path $target -Parent }
             $lo = if ($s.Arguments) { $s.Arguments } else { '' }
-            $res += New-AppItem $lnk.BaseName 'App' $target ('"' + $target + '"') ('"' + $wd + '"') $lo $target
+            # un launcher si riconosce dall'exe (Google Play Giochi ha un nome generico: dalla cartella);
+            # con argomenti e' un altro strumento, es. "App Recovery" di EA = EALauncher.exe -recovery
+            $isLauncher = -not $s.Arguments -and ($target -like '*\Google\Play Games\*' -or
+                $script:GameLaunchers -contains (Split-Path $target -Leaf).ToLower())
+            $kind = if ($isLauncher) { 'Launcher' } else { 'App' }
+            $res += New-AppItem $lnk.BaseName $kind $target ('"' + $target + '"') ('"' + $wd + '"') $lo $target
         }
     }
     return $res
@@ -1509,7 +1553,9 @@ if ($SelfTest) {
     # scanner launcher
     foreach ($scanner in 'Get-BattleNetGames', 'Get-EpicGames', 'Get-GogGames', 'Get-UbisoftGames', 'Get-StartMenuPrograms') {
         $found = @(& $scanner)
-        Write-Host "$scanner : $($found.Count)"
+        $perKind = ($found | Group-Object Kind | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
+        Write-Host "$scanner : $($found.Count) ($perKind)"
+        $found | Where-Object { $_.Kind -notin 'App', 'Epic', 'Battle.net' } | ForEach-Object { Write-Host "   * $($_.Name) [$($_.Kind)] Opts=$($_.LaunchOptions)" }
         $found | Select-Object -First 3 | ForEach-Object { Write-Host "   - $($_.Name) [$($_.Kind)] Exe=$($_.Exe) Opts=$($_.LaunchOptions)" }
     }
     # account con nomi
@@ -1675,6 +1721,8 @@ $script:KindColor = @{
     'UWP'        = [System.Drawing.Color]::FromArgb(140, 175, 230)
     'App'        = [System.Drawing.Color]::FromArgb(150, 150, 162)
     'EXE'        = [System.Drawing.Color]::FromArgb(230, 170, 90)
+    'Google Play' = [System.Drawing.Color]::FromArgb(120, 210, 150)
+    'Launcher'   = [System.Drawing.Color]::FromArgb(240, 140, 120)
 }
 $script:PillFont = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
 
@@ -2066,7 +2114,7 @@ function Reload-Apps {
         }
     }
     # i giochi dei launcher prima, poi UWP e app generiche, in ordine alfabetico
-    $order = @{ 'Battle.net' = 0; 'Epic' = 0; 'GOG' = 0; 'Ubisoft' = 0; 'UWP' = 1; 'App' = 2; 'EXE' = 2 }
+    $order = @{ 'Battle.net' = 0; 'Epic' = 0; 'GOG' = 0; 'Ubisoft' = 0; 'Google Play' = 0; 'Launcher' = 0; 'UWP' = 1; 'App' = 2; 'EXE' = 2 }
     $script:allApps = @($apps | Sort-Object { $order[$_.Kind] }, Name)
     $script:PrevApp = $null
     Refresh-ExistingMap
