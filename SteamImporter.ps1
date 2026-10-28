@@ -262,17 +262,85 @@ function Get-EpicGames {
     $res = @()
     $mdir = 'C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests'
     if (-not (Test-Path $mdir)) { return $res }
+    $byApp = [ordered]@{}
     foreach ($f in Get-ChildItem $mdir -Filter '*.item' -ErrorAction SilentlyContinue) {
-        try { $m = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
-        if (-not $m.DisplayName -or -not $m.InstallLocation -or -not (Test-Path $m.InstallLocation)) { continue }
+        # i manifest sono UTF-8 senza BOM: senza -Encoding "LEGO®" diventa "LEGOÂ®"
+        try { $m = Get-Content $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        if (-not $m.DisplayName -or -not $m.InstallLocation) { continue }
         if ($m.bIsIncompleteInstall) { continue }
+        # DLC e contenuti aggiuntivi ("Contenuti di Fortnite...") non si avviano da soli
+        if ($m.bIsApplication -eq $false) { continue }
+        if ($m.MainGameAppName -and $m.MainGameAppName -ne $m.AppName) { continue }
+        try { if (-not (Test-Path $m.InstallLocation)) { continue } } catch { continue }   # disco scollegato
         $gameExe = $null
         if ($m.LaunchExecutable) {
             $p = Join-Path $m.InstallLocation $m.LaunchExecutable
             if (Test-Path $p) { $gameExe = $p }
         }
+        # lo stesso gioco puo' avere piu' manifest (vecchie installazioni): tengo quello con l'exe presente
+        $old = $byApp[$m.AppName]
+        if ($old -and ($old.Icon -or -not $gameExe)) { continue }
         $uri = "com.epicgames.launcher://apps/$($m.AppName)?action=launch&silent=true"
-        $res += New-AppItem $m.DisplayName 'Epic' $m.InstallLocation '"C:\WINDOWS\explorer.exe"' '"C:\WINDOWS"' $uri $(if ($gameExe) { $gameExe } else { '' })
+        $byApp[$m.AppName] = New-AppItem $m.DisplayName 'Epic' $m.InstallLocation '"C:\WINDOWS\explorer.exe"' '"C:\WINDOWS"' $uri $(if ($gameExe) { $gameExe } else { '' })
+    }
+    $res = @($byApp.Values)
+    return $res
+}
+
+function Find-SteamCacheImage([string]$SteamPath, [string]$AppId, [string]$Type) {
+    # immagini che Steam stesso tiene in appcache\librarycache (layout nuovo per cartella e vecchio piatto)
+    $cache = Join-Path $SteamPath 'appcache\librarycache'
+    $dir = Join-Path $cache $AppId
+    if ($Type -eq 'cover') {
+        if (Test-Path $dir) {
+            $f = Get-ChildItem $dir -Filter 'library_600x900.jpg' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($f) { return $f.FullName }
+        }
+        $old = Join-Path $cache "$($AppId)_library_600x900.jpg"
+    } else {
+        # l'icona e' il jpg col nome di 40 caratteri esadecimali
+        if (Test-Path $dir) {
+            $f = Get-ChildItem $dir -Filter '*.jpg' -ErrorAction SilentlyContinue |
+                Where-Object { $_.BaseName -match '^[0-9a-f]{40}$' } | Select-Object -First 1
+            if ($f) { return $f.FullName }
+        }
+        $old = Join-Path $cache "$($AppId)_icon.jpg"
+    }
+    if (Test-Path $old) { return $old }
+    return $null
+}
+function Get-SteamGames([string]$SteamPath = (Get-SteamPath)) {
+    # giochi gia' nella libreria Steam: in lista solo per vederli, non si possono aggiungere
+    $res = @()
+    if (-not $SteamPath) { return $res }
+    $libs = @($SteamPath)
+    $lf = Join-Path $SteamPath 'steamapps\libraryfolders.vdf'
+    if (Test-Path $lf) {
+        foreach ($m in [regex]::Matches((Get-Content $lf -Raw -Encoding UTF8), '"path"\s+"([^"]+)"')) {
+            $libs += ($m.Groups[1].Value -replace '\\\\', '\')
+        }
+    }
+    $seen = @{}
+    foreach ($lib in ($libs | Select-Object -Unique)) {
+        $sa = Join-Path $lib 'steamapps'
+        try { if (-not (Test-Path $sa)) { continue } } catch { continue }   # disco scollegato
+        foreach ($f in Get-ChildItem $sa -Filter 'appmanifest_*.acf' -ErrorAction SilentlyContinue) {
+            $t = Get-Content $f.FullName -Raw -Encoding UTF8
+            $id = [regex]::Match($t, '"appid"\s+"(\d+)"').Groups[1].Value
+            $name = [regex]::Match($t, '"name"\s+"([^"]*)"').Groups[1].Value
+            $flags = [regex]::Match($t, '"StateFlags"\s+"(\d+)"').Groups[1].Value
+            $dir = [regex]::Match($t, '"installdir"\s+"([^"]*)"').Groups[1].Value
+            if (-not $id -or -not $name -or $seen[$id]) { continue }
+            # bit 4 = installato (6 e 1030 sono installati con aggiornamento in sospeso)
+            if (-not $flags -or -not ([int]$flags -band 4)) { continue }
+            # componenti di sistema di Steam, non giochi
+            if ($id -eq '228980' -or $name -match '^(Proton|Steam Linux Runtime|Steamworks Common)') { continue }
+            $seen[$id] = $true
+            $icon = Find-SteamCacheImage $SteamPath $id 'icon'
+            $o = New-AppItem $name 'Steam' (Join-Path $sa "common\$dir") $null $null $null $(if ($icon) { $icon } else { '' })
+            $o | Add-Member -NotePropertyName SteamGameId -NotePropertyValue $id
+            $res += $o
+        }
     }
     return $res
 }
@@ -311,20 +379,49 @@ function Get-UbisoftGames {
     return $res
 }
 
+# launcher di giochi riconosciuti dal nome dell'exe: in lista vanno tra i Giochi, non tra le App
+$script:GameLaunchers = @(
+    'prismlauncher.exe', 'multimc.exe', 'polymc.exe', 'atlauncher.exe', 'minecraftlauncher.exe', 'minecraft.exe',
+    'lunar client.exe', 'eadesktop.exe', 'ealauncher.exe', 'upc.exe', 'ubisoftconnect.exe', 'galaxyclient.exe',
+    'epicgameslauncher.exe', 'battle.net launcher.exe', 'battle.net.exe', 'riotclientservices.exe',
+    'amazon games ui.exe', 'itch.exe', 'playnite.desktopapp.exe', 'playnite.fullscreenapp.exe', 'heroic.exe'
+)
+function Get-LnkUrl([string]$Path) {
+    # i collegamenti di Google Play Giochi non puntano a un exe: l'indirizzo di avvio
+    # e' solo dentro il file .lnk (in UTF-16), dove WScript.Shell non lo vede
+    try {
+        $b = [System.IO.File]::ReadAllBytes($Path)
+        $txt = [System.Text.Encoding]::Unicode.GetString($b) + ' ' + [System.Text.Encoding]::ASCII.GetString($b)
+        $m = [regex]::Match($txt, 'googleplaygames://launch/\?[^\x00\s"]+')
+        if ($m.Success) { return $m.Value }
+    } catch {}
+    return $null
+}
 function Get-StartMenuPrograms {
     # Programmi win32 dal menu Start (.lnk) - per giochi/app installati fuori dai launcher
     $res = @()
     $sh = New-Object -ComObject WScript.Shell
     $seen = @{}
     # parole intere, per non scartare app legittime tipo "Updater Pro" o "HelpDesk"
-    $junk = '(^|[\W_])(uninstall|uninstaller|unins\d*|setup|repair|readme|manual|help|guida|documentation|website|sito|update|updates)([\W_]|$)'
+    $junk = '(^|[\W_])(uninstall|uninstaller|unins\d*|disinstalla|disinstallazione|setup|repair|readme|manual|help|guida|documentation|website|sito|update|updates)([\W_]|$)'
     foreach ($dir in "$env:APPDATA\Microsoft\Windows\Start Menu\Programs", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs") {
         if (-not (Test-Path $dir)) { continue }
         foreach ($lnk in Get-ChildItem $dir -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue) {
             if ($lnk.BaseName -match $junk) { continue }
             try { $s = $sh.CreateShortcut($lnk.FullName) } catch { continue }
             $target = $s.TargetPath
-            if (-not $target -or $target -notlike '*.exe' -or -not (Test-Path $target)) { continue }
+            if (-not $target) {
+                $url = Get-LnkUrl $lnk.FullName
+                if ($url -and -not $seen[$url]) {
+                    $seen[$url] = $true
+                    $pkg = if ($url -match '[?&]id=([^&]+)') { $Matches[1] } else { $url }
+                    $ico = ($s.IconLocation -replace ',-?\d+$', '')
+                    if (-not $ico -or -not (Test-Path $ico)) { $ico = '' }
+                    $res += New-AppItem $lnk.BaseName 'Google Play' $pkg '"C:\WINDOWS\explorer.exe"' '"C:\WINDOWS"' $url $ico
+                }
+                continue
+            }
+            if ($target -notlike '*.exe' -or -not (Test-Path $target)) { continue }
             if ($target -like "$env:WINDIR*") { continue }
             if ((Split-Path $target -Leaf) -match $junk) { continue }
             $key = $target.ToLower()
@@ -332,7 +429,12 @@ function Get-StartMenuPrograms {
             $seen[$key] = $true
             $wd = if ($s.WorkingDirectory -and (Test-Path $s.WorkingDirectory)) { $s.WorkingDirectory } else { Split-Path $target -Parent }
             $lo = if ($s.Arguments) { $s.Arguments } else { '' }
-            $res += New-AppItem $lnk.BaseName 'App' $target ('"' + $target + '"') ('"' + $wd + '"') $lo $target
+            # un launcher si riconosce dall'exe (Google Play Giochi ha un nome generico: dalla cartella);
+            # con argomenti e' un altro strumento, es. "App Recovery" di EA = EALauncher.exe -recovery
+            $isLauncher = -not $s.Arguments -and ($target -like '*\Google\Play Games\*' -or
+                $script:GameLaunchers -contains (Split-Path $target -Leaf).ToLower())
+            $kind = if ($isLauncher) { 'Launcher' } else { 'App' }
+            $res += New-AppItem $lnk.BaseName $kind $target ('"' + $target + '"') ('"' + $wd + '"') $lo $target
         }
     }
     return $res
@@ -362,6 +464,28 @@ $script:TradEN = @{
     'Salva'                                          = 'Save'
     'Aggiungi a Steam'                               = 'Add to Steam'
     'Pronto.'                                        = 'Ready.'
+    'Piattaforma'                                    = 'Platform'
+    'Stato'                                          = 'Status'
+    'Percorso'                                       = 'Path'
+    'Copertine...'                                   = 'Artwork...'
+    'Tutti'                                          = 'All'
+    'Giochi'                                         = 'Games'
+    'App'                                            = 'Apps'
+    'Nascondi gia'' in Steam'                        = 'Hide already in Steam'
+    'Seleziona i giochi'                             = 'Select games'
+    'Deseleziona tutto'                              = 'Clear selection'
+    'Aggiungi {0} app a Steam'                       = 'Add {0} apps to Steam'
+    '{0} app in elenco - {1} gia'' in Steam - {2} selezionate.' = '{0} apps listed - {1} already in Steam - {2} selected.'
+    'Seleziona un''app per vedere l''anteprima.'     = 'Select an app to see its preview.'
+    'Comando di avvio'                               = 'Launch command'
+    'Gia'' in Steam'                                 = 'Already in Steam'
+    'Non ancora in Steam'                            = 'Not in Steam yet'
+    'Cerco la copertina...'                          = 'Looking for the cover...'
+    'Nessuna copertina trovata'                      = 'No cover found'
+    'Inserisci la API key per vedere la copertina'   = 'Enter the API key to see the cover'
+    '({0}/{1}) {2}'                                  = '({0}/{1}) {2}'
+    '({0}/{1}) {2} - scarico gli artwork...'         = '({0}/{1}) {2} - downloading artwork...'
+    '({0}/{1}) {2} - gia'' presente, salto'          = '({0}/{1}) {2} - already there, skipping'
     'English'                                        = 'Italiano'
     # --- messaggi di stato ---
     'Scansione app installate (UWP, Battle.net, Epic, GOG, Ubisoft, menu Start)...' = 'Scanning installed apps (UWP, Battle.net, Epic, GOG, Ubisoft, Start menu)...'
@@ -580,25 +704,35 @@ function Stop-SteamGracefully([string]$SteamPath, [int]$TimeoutSec = 20) {
 }
 
 # ---------------------------------------------------------------- Rilevamento app gia' aggiunte
+function Get-AppLaunchParts($App) {
+    # exe e opzioni esattamente come verranno scritti in shortcuts.vdf
+    if ($App.Kind -eq 'Steam') {
+        return @("steam://rungameid/$($App.SteamGameId)", '')
+    }
+    if ($App.Kind -eq 'UWP') {
+        return @('"C:\WINDOWS\explorer.exe"', "shell:AppsFolder\$($App.Aumid)")
+    } elseif ($App.Exe) {
+        return @($App.Exe, [string]$App.LaunchOptions)
+    } elseif ($App.ExePath) {
+        return @(('"' + $App.ExePath + '"'), '')
+    }
+    return $null
+}
 function Get-AppSignature($App) {
     # firma exe|launch identica a quella usata in export, per capire se un'app e' gia' in Steam
-    if ($App.Kind -eq 'UWP') {
-        $exe = '"C:\WINDOWS\explorer.exe"'; $launch = "shell:AppsFolder\$($App.Aumid)"
-    } elseif ($App.Exe) {
-        $exe = $App.Exe; $launch = $App.LaunchOptions
-    } elseif ($App.ExePath) {
-        $exe = '"' + $App.ExePath + '"'; $launch = ''
-    } else { return $null }
-    return "$exe|$launch".ToLower()
+    $p = Get-AppLaunchParts $App
+    if (-not $p) { return $null }
+    return "$($p[0])|$($p[1])".ToLower()
 }
 function Get-ExistingShortcutMap([string]$SteamPath, [string]$AccountId) {
-    # mappa firma -> { Key; Name } delle shortcut non-Steam gia' presenti
+    # mappa firma -> { Key; Name; AppId } delle shortcut non-Steam gia' presenti
     $map = @{}
     $vdf = Join-Path $SteamPath "userdata\$AccountId\config\shortcuts.vdf"
     $sc = Read-ShortcutsVdf $vdf
     foreach ($k in $sc.Keys) {
         $e = $sc[$k]
-        $map[("$($e['Exe'])|$($e['LaunchOptions'])").ToLower()] = @{ Key = $k; Name = [string]$e['AppName'] }
+        $id = if ($e.Contains('appid')) { [uint32]$e['appid'] } else { Get-ShortcutAppId $e['Exe'] $e['AppName'] }
+        $map[("$($e['Exe'])|$($e['LaunchOptions'])").ToLower()] = @{ Key = $k; Name = [string]$e['AppName']; AppId = $id }
     }
     return $map
 }
@@ -608,7 +742,9 @@ function Export-ToSteam {
     param(
         [string]$SteamPath, [string]$AccountId,
         [object[]]$Items,          # oggetti con: Name, Kind ('UWP'|'EXE'), Aumid/ExePath, Icon
-        [string]$SgdbApiKey
+        [string]$SgdbApiKey,
+        # facoltativo, chiamato con (fase 'item'|'skip'|'done', item, indice, totale, copertina)
+        [scriptblock]$OnProgress
     )
     $configDir = Join-Path $SteamPath "userdata\$AccountId\config"
     if (-not (Test-Path $configDir)) { New-Item -ItemType Directory -Force $configDir | Out-Null }
@@ -632,7 +768,9 @@ function Export-ToSteam {
     $nextIndex = ($shortcuts.Keys | ForEach-Object { [int]$_ } | Measure-Object -Maximum).Maximum
     if ($null -eq $nextIndex) { $nextIndex = -1 }
 
+    $pos = 0
     foreach ($item in $Items) {
+        $pos++
         if ($item.Kind -eq 'UWP') {
             $exe = '"C:\WINDOWS\explorer.exe"'
             $startDir = '"C:\WINDOWS"'
@@ -648,7 +786,12 @@ function Export-ToSteam {
             $launch = ''
         }
         $key = "$exe|$launch".ToLower()
-        if ($existing[$key]) { $skipped++; continue }
+        if ($existing[$key]) {
+            $skipped++
+            if ($OnProgress) { & $OnProgress 'skip' $item $pos $Items.Count $null }
+            continue
+        }
+        if ($OnProgress) { & $OnProgress 'item' $item $pos $Items.Count $null }
 
         $icon = if ($item.Icon) { $item.Icon } else { '' }
         $entry = New-ShortcutEntry -AppName $item.Name -Exe $exe -StartDir $startDir -LaunchOptions $launch -Icon $icon
@@ -665,6 +808,11 @@ function Export-ToSteam {
         if ($item.Icon -and ([System.IO.Path]::GetExtension($item.Icon) -in '.png', '.jpg', '.jpeg') -and
             -not (Test-Path (Join-Path $gridDir "$($appid)p.png"))) {
             Copy-Item $item.Icon (Join-Path $gridDir "$($appid)p.png") -Force -ErrorAction SilentlyContinue
+        }
+        if ($OnProgress) {
+            $cover = Get-ChildItem $gridDir -Filter "$($appid)p.*" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -in '.png', '.jpg', '.jpeg' } | Select-Object -First 1
+            & $OnProgress 'done' $item $pos $Items.Count $(if ($cover) { $cover.FullName } else { $null })
         }
     }
 
@@ -718,6 +866,11 @@ $script:Th = @{
     BtnBg       = [System.Drawing.Color]::FromArgb(44, 44, 52)
     BtnHover    = [System.Drawing.Color]::FromArgb(62, 58, 80)
     Header      = [System.Drawing.Color]::FromArgb(9, 9, 11)
+    Sel         = [System.Drawing.Color]::FromArgb(52, 38, 86)
+    RowAlt      = [System.Drawing.Color]::FromArgb(32, 32, 37)
+    Line        = [System.Drawing.Color]::FromArgb(58, 58, 70)
+    Ok          = [System.Drawing.Color]::FromArgb(110, 205, 140)
+    InSteam     = [System.Drawing.Color]::FromArgb(196, 160, 255)
 }
 function New-RoundPath([System.Drawing.Rectangle]$R, [int]$Rad) {
     $p = New-Object System.Drawing.Drawing2D.GraphicsPath
@@ -774,7 +927,7 @@ function Hide-ComboArrow([System.Windows.Forms.ComboBox]$Cmb) {
     $Cmb.Parent.Controls.Add($mask)
     $mask.BringToFront()
 }
-function Set-DarkListHeader([System.Windows.Forms.ListView]$Lv) {
+function Set-DarkListHeader([System.Windows.Forms.ListView]$Lv, [scriptblock]$CellPainter) {
     # l'intestazione delle colonne non segue i colori del controllo: la disegno io
     $Lv.OwnerDraw = $true
     $Lv.Add_DrawColumnHeader({
@@ -790,9 +943,60 @@ function Set-DarkListHeader([System.Windows.Forms.ListView]$Lv) {
             $script:Th.Sub, ([System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor
                              [System.Windows.Forms.TextFormatFlags]::EndEllipsis))
     })
+    if ($CellPainter) {
+        # celle disegnate da chi chiama, riga per riga (DrawItem non deve disegnare niente)
+        $Lv.Add_DrawItem({ param($s, $e) })
+        $Lv.Add_DrawSubItem($CellPainter)
+        return
+    }
     # righe e celle restano quelle standard (con i colori gia' impostati)
     $Lv.Add_DrawItem({ param($s, $e) $e.DrawDefault = $true })
     $Lv.Add_DrawSubItem({ param($s, $e) $e.DrawDefault = $true })
+}
+function Set-DoubleBuffered([System.Windows.Forms.Control]$Ctl) {
+    # niente sfarfallio nei controlli ridisegnati a mano (la proprieta' e' protetta)
+    try {
+        $Ctl.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($Ctl, $true, $null)
+    } catch {}
+}
+function New-GlyphImage([int]$Code, [System.Drawing.Color]$Color) {
+    # icona 16x16 presa dal font di sistema di Windows (Segoe Fluent Icons / MDL2 Assets)
+    if ($null -eq $script:GlyphFontName) {
+        $names = @([System.Drawing.FontFamily]::Families | ForEach-Object { $_.Name })
+        $script:GlyphFontName = @('Segoe Fluent Icons', 'Segoe MDL2 Assets') | Where-Object { $names -contains $_ } | Select-Object -First 1
+        if (-not $script:GlyphFontName) { $script:GlyphFontName = '' }
+    }
+    if (-not $script:GlyphFontName) { return $null }
+    $bmp = New-Object System.Drawing.Bitmap(16, 16)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+    $font = New-Object System.Drawing.Font($script:GlyphFontName, 12, [System.Drawing.GraphicsUnit]::Pixel)
+    $br = New-Object System.Drawing.SolidBrush($Color)
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
+    $g.DrawString([string][char]$Code, $font, $br, (New-Object System.Drawing.RectangleF(0, 0, 16, 16)), $sf)
+    $sf.Dispose(); $br.Dispose(); $font.Dispose(); $g.Dispose()
+    return $bmp
+}
+function Draw-Pill([System.Drawing.Graphics]$G, [string]$Text, [System.Drawing.Font]$Font, [System.Drawing.Rectangle]$Cell, [System.Drawing.Color]$Color) {
+    # etichetta arrotondata colorata, allineata a sinistra nella cella
+    $flags = [System.Windows.Forms.TextFormatFlags]::NoPadding
+    $sz = [System.Windows.Forms.TextRenderer]::MeasureText($G, $Text, $Font, (New-Object System.Drawing.Size(0, 0)), $flags)
+    $h = 20
+    $w = [Math]::Min(($sz.Width + 18), ($Cell.Width - 12))
+    if ($w -le 20) { return }
+    $r = New-Object System.Drawing.Rectangle(($Cell.X + 6), ($Cell.Y + [int](($Cell.Height - $h) / 2)), $w, $h)
+    $old = $G.SmoothingMode
+    $G.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $path = New-RoundPath $r 9
+    $br = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(38, $Color))
+    $G.FillPath($br, $path); $br.Dispose()
+    $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(110, $Color))
+    $G.DrawPath($pen, $path); $pen.Dispose(); $path.Dispose()
+    $G.SmoothingMode = $old
+    [System.Windows.Forms.TextRenderer]::DrawText($G, $Text, $Font, $r, $Color, ($flags -bor
+        [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor
+        [System.Windows.Forms.TextFormatFlags]::EndEllipsis))
 }
 function New-CheckImage([bool]$Checked) {
     # casella di spunta disegnata a mano, al posto di quella bianca di sistema
@@ -840,7 +1044,7 @@ function Set-RoundButton([System.Windows.Forms.Button]$B) {
         $g.Clear($b.Parent.BackColor)
         $rect = New-Object System.Drawing.Rectangle(0, 0, ($b.Width - 1), ($b.Height - 1))
         $path = New-RoundPath $rect $t.Radius
-        $fill = if ($t.Hover) { $t.RHover } else { $t.RFill }
+        $fill = if (-not $b.Enabled) { $script:Th.Panel } elseif ($t.Hover) { $t.RHover } else { $t.RFill }
         $br = New-Object System.Drawing.SolidBrush($fill)
         $g.FillPath($br, $path); $br.Dispose()
         $pen = New-Object System.Drawing.Pen($t.RBorder, 1)
@@ -853,9 +1057,11 @@ function Set-RoundButton([System.Windows.Forms.Button]$B) {
             $off = 9 + $t.RImage.Width
             $txtRect = New-Object System.Drawing.Rectangle($off, 0, ($b.Width - $off - 1), ($b.Height - 1))
         }
-        [System.Windows.Forms.TextRenderer]::DrawText($g, $b.Text, $b.Font, $txtRect, $t.RText,
+        $txtCol = if ($b.Enabled) { $t.RText } else { $script:Th.Sub }
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $b.Text, $b.Font, $txtRect, $txtCol,
             ([System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter))
     })
+    $B.Add_EnabledChanged({ $this.Invalidate() })
 }
 function Apply-Theme([System.Windows.Forms.Control]$Root) {
     $Root.BackColor = $script:Th.Bg
@@ -1122,7 +1328,7 @@ function Show-ArtworkManager([string]$SteamPath, [string]$AccountId, [string]$Ap
                     param($sender, $e)
                     $info = $sender.Tag
                     foreach ($c in $sender.Parent.Controls) { $c.BackColor = [System.Drawing.Color]::Transparent }
-                    $sender.BackColor = [System.Drawing.Color]::DodgerBlue
+                    $sender.BackColor = $script:Th.Accent
                     $script:amSel[$info.TabIndex] = $info.Data
                     $st.Text = (T 'Selezionata immagine per ''{0}''.') -f $cats[$info.TabIndex].Title
                 })
@@ -1406,9 +1612,11 @@ if ($SelfTest) {
     }
 
     # scanner launcher
-    foreach ($scanner in 'Get-BattleNetGames', 'Get-EpicGames', 'Get-GogGames', 'Get-UbisoftGames', 'Get-StartMenuPrograms') {
+    foreach ($scanner in 'Get-BattleNetGames', 'Get-EpicGames', 'Get-GogGames', 'Get-UbisoftGames', 'Get-StartMenuPrograms', 'Get-SteamGames') {
         $found = @(& $scanner)
-        Write-Host "$scanner : $($found.Count)"
+        $perKind = ($found | Group-Object Kind | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
+        Write-Host "$scanner : $($found.Count) ($perKind)"
+        $found | Where-Object { $_.Kind -notin 'App', 'Epic', 'Battle.net', 'Steam' } | ForEach-Object { Write-Host "   * $($_.Name) [$($_.Kind)] Opts=$($_.LaunchOptions)" }
         $found | Select-Object -First 3 | ForEach-Object { Write-Host "   - $($_.Name) [$($_.Kind)] Exe=$($_.Exe) Opts=$($_.LaunchOptions)" }
     }
     # account con nomi
@@ -1447,24 +1655,44 @@ if (-not $steamPath) {
 }
 $accounts = @(Get-SteamAccounts $steamPath)
 
+# Disposizione: lista a sinistra, anteprima a destra, comandi in basso.
+# Le coordinate sono quelle prima dell'intestazione (Add-HeaderBar sposta tutto di 44px).
 $form = New-Object System.Windows.Forms.Form
 $form.Text = T 'SteamImporter - aggiungi app non-Steam a Steam'
-$form.Size = New-Object System.Drawing.Size(820, 620)
+$form.ClientSize = New-Object System.Drawing.Size(1064, 640)
 $form.MinimumSize = $form.Size
 $form.StartPosition = 'CenterScreen'
+$W = 1064
+$prevW = 268
+$listW = $W - 32 - $prevW - 12
 
+# ---- riga 1: account, ricerca, app di sistema
 $lblAcc = New-Object System.Windows.Forms.Label
 $lblAcc.Text = T 'Account Steam:'
-$lblAcc.Location = '12,14'; $lblAcc.AutoSize = $true
+$lblAcc.Location = '16,16'; $lblAcc.AutoSize = $true
 
 $cmbAcc = New-Object System.Windows.Forms.ComboBox
 $cmbAcc.DropDownStyle = 'DropDownList'
-$cmbAcc.Location = '110,10'; $cmbAcc.Width = 260
+$cmbAcc.Location = '124,12'; $cmbAcc.Width = 300
+# disegnata a mano: senza, la voce scelta resta evidenziata in blu di sistema
+$cmbAcc.DrawMode = 'OwnerDrawFixed'; $cmbAcc.ItemHeight = 20
+$cmbAcc.Add_DrawItem({
+    param($s, $e)
+    if ($e.Index -lt 0) { return }
+    $isEdit = [bool]($e.State -band [System.Windows.Forms.DrawItemState]::ComboBoxEdit)
+    $isSel = [bool]($e.State -band [System.Windows.Forms.DrawItemState]::Selected)
+    $bg = if ($isSel -and -not $isEdit) { $script:Th.BtnHover } else { $script:Th.Input }
+    $br = New-Object System.Drawing.SolidBrush($bg)
+    $e.Graphics.FillRectangle($br, $e.Bounds); $br.Dispose()
+    $r = New-Object System.Drawing.Rectangle(($e.Bounds.X + 6), $e.Bounds.Y, ($e.Bounds.Width - 8), $e.Bounds.Height)
+    [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, [string]$s.Items[$e.Index], $s.Font, $r, $script:Th.Text,
+        ([System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis))
+})
 foreach ($a in $accounts) { [void]$cmbAcc.Items.Add("$($a.Name)  -  $($a.Id)  (ultimo uso: $($a.LastUsed.ToString('dd/MM/yyyy')))") }
 if ($cmbAcc.Items.Count -gt 0) { $cmbAcc.SelectedIndex = 0 }
 
 $txtFilter = New-Object System.Windows.Forms.TextBox
-$txtFilter.Location = '380,10'; $txtFilter.Width = 180
+$txtFilter.Location = '440,13'; $txtFilter.Width = 220
 
 Add-Type @'
 using System;
@@ -1475,36 +1703,77 @@ public class SINative {
 }
 '@
 
-
 $chkAll = New-Object System.Windows.Forms.CheckBox
 $chkAll.Text = T 'Mostra anche app di sistema'
-$chkAll.Location = '570,11'; $chkAll.AutoSize = $true
+$chkAll.Location = '676,15'; $chkAll.AutoSize = $true
 
+# ---- riga 2: filtri per piattaforma, nascondi gia' in Steam, selezione rapida
+$script:KindFilter = 'all'
+$script:ChipDefs = @(
+    @{ Key = 'all'; Text = 'Tutti' }, @{ Key = 'games'; Text = 'Giochi' },
+    @{ Key = 'uwp'; Text = 'UWP' }, @{ Key = 'apps'; Text = 'App' })
+$script:Chips = @{}
+$pnlChips = New-Object System.Windows.Forms.FlowLayoutPanel
+$pnlChips.Location = '16,46'; $pnlChips.Size = '420,30'
+$pnlChips.WrapContents = $false
+foreach ($d in $script:ChipDefs) {
+    $b = New-Object System.Windows.Forms.Button
+    $b.Name = $d.Key          # il filtro da attivare; il Tag lo usa gia' Set-RoundButton
+    $b.Size = '96,26'; $b.Margin = New-Object System.Windows.Forms.Padding(0, 2, 6, 2)
+    $b.Add_Click({ $script:KindFilter = $this.Name; Update-List })
+    [void]$pnlChips.Controls.Add($b)
+    $script:Chips[$d.Key] = $b
+}
+
+$chkHide = New-Object System.Windows.Forms.CheckBox
+$chkHide.Text = T 'Nascondi gia'' in Steam'
+$chkHide.Location = '446,51'; $chkHide.AutoSize = $true
+
+$pnlLinks = New-Object System.Windows.Forms.FlowLayoutPanel
+$pnlLinks.Location = New-Object System.Drawing.Point(($W - 16 - 320), 47)
+$pnlLinks.Size = '320,28'; $pnlLinks.Anchor = 'Top,Right'
+$pnlLinks.FlowDirection = 'RightToLeft'; $pnlLinks.WrapContents = $false
+$lnkNone = New-Object System.Windows.Forms.LinkLabel
+$lnkSel = New-Object System.Windows.Forms.LinkLabel
+foreach ($l in @($lnkNone, $lnkSel)) {
+    $l.AutoSize = $true; $l.Margin = New-Object System.Windows.Forms.Padding(12, 5, 0, 0)
+    $l.LinkBehavior = 'HoverUnderline'
+    [void]$pnlLinks.Controls.Add($l)
+}
+$lnkSel.Text = T 'Seleziona i giochi'
+$lnkNone.Text = T 'Deseleziona tutto'
+
+# ---- lista delle app
 $list = New-Object System.Windows.Forms.ListView
 $list.View = 'Details'; $list.CheckBoxes = $true; $list.FullRowSelect = $true
+$list.MultiSelect = $false
 $list.LabelEdit = $true
-$list.Location = '12,42'
-$list.Size = New-Object System.Drawing.Size(780, 420)
+$list.Location = '16,82'
+$list.Size = New-Object System.Drawing.Size($listW, 426)
 $list.Anchor = 'Top,Bottom,Left,Right'
-[void]$list.Columns.Add((T 'Nome (doppio click per rinominare)'), 260)
-[void]$list.Columns.Add((T 'Tipo'), 75)
-[void]$list.Columns.Add((T 'In Steam'), 70)
-[void]$list.Columns.Add((T 'Dettaglio'), 295)
-# icona di ogni app nella prima colonna (l'altezza delle righe segue l'immagine)
-$script:imgList = New-Object System.Windows.Forms.ImageList
-$script:imgList.ImageSize = New-Object System.Drawing.Size(20, 20)
-$script:imgList.ColorDepth = 'Depth32Bit'
-$list.SmallImageList = $script:imgList
+[void]$list.Columns.Add('', 270)
+[void]$list.Columns.Add('', 112)
+[void]$list.Columns.Add('', 126)
+[void]$list.Columns.Add('', 240)
+# l'ImageList serve solo a dare spazio: righe alte 30px e 24px riservati all'icona,
+# che poi disegno io a 20px dalle bitmap in $script:iconBmps
+$rowImgs = New-Object System.Windows.Forms.ImageList
+$rowImgs.ImageSize = New-Object System.Drawing.Size(24, 30)
+$list.SmallImageList = $rowImgs
+$script:iconBmps = New-Object System.Collections.ArrayList
 $script:iconIndex = @{}
-# caselle di spunta scure al posto di quelle bianche di sistema
+# caselle di spunta scure: lo StateImageList fa funzionare il clic, il disegno e' mio
+$script:ChkOff = New-CheckImage $false
+$script:ChkOn = New-CheckImage $true
 $stateImgs = New-Object System.Windows.Forms.ImageList
 $stateImgs.ImageSize = New-Object System.Drawing.Size(16, 16)
 $stateImgs.ColorDepth = 'Depth32Bit'
-$stateImgs.Images.Add((New-CheckImage $false))
-$stateImgs.Images.Add((New-CheckImage $true))
+$stateImgs.Images.Add($script:ChkOff)
+$stateImgs.Images.Add($script:ChkOn)
 $list.StateImageList = $stateImgs
+Set-DoubleBuffered $list
 
-# colore della colonna "Tipo", uno per fonte
+# colore dell'etichetta "Piattaforma", uno per fonte
 $script:KindColor = @{
     'Battle.net' = [System.Drawing.Color]::FromArgb(88, 165, 235)
     'Epic'       = [System.Drawing.Color]::FromArgb(215, 215, 225)
@@ -1512,75 +1781,228 @@ $script:KindColor = @{
     'Ubisoft'    = [System.Drawing.Color]::FromArgb(120, 195, 255)
     'UWP'        = [System.Drawing.Color]::FromArgb(140, 175, 230)
     'App'        = [System.Drawing.Color]::FromArgb(150, 150, 162)
-    'EXE'        = [System.Drawing.Color]::FromArgb(150, 150, 162)
+    'EXE'        = [System.Drawing.Color]::FromArgb(230, 170, 90)
+    'Google Play' = [System.Drawing.Color]::FromArgb(120, 210, 150)
+    'Launcher'   = [System.Drawing.Color]::FromArgb(240, 140, 120)
+    'Steam'      = [System.Drawing.Color]::FromArgb(102, 192, 244)
+}
+$script:PillFont = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+
+function Get-KindGroup([string]$Kind) {
+    if ($Kind -eq 'UWP') { return 'uwp' }
+    if ($Kind -in 'App', 'EXE') { return 'apps' }
+    return 'games'
+}
+function Test-InSteam($App) {
+    return ([bool]$App.VdfKey -or $App.Kind -eq 'Steam')
+}
+function Test-SystemApp($App) {
+    return ($App.Kind -eq 'UWP' -and ($App.Pfn -like 'Microsoft.*' -or $App.Pfn -like 'MicrosoftWindows.*' -or
+            $App.Pfn -like 'MicrosoftCorporationII.*' -or $App.Pfn -like 'windows.*'))
+}
+function Get-AppIconSource($App) {
+    if ($App.Kind -eq 'UWP') { return (Get-UwpIcon $App $iconCache) }
+    if ($App.Icon) { return $App.Icon }
+    return $App.ExePath
+}
+function Get-IconBitmap([string]$Src) {
+    # bitmap staccata dal file (che cosi' non resta bloccato)
+    if (-not $Src -or -not (Test-Path $Src)) { return $null }
+    try {
+        if ($Src -like '*.exe' -or $Src -like '*.ico') {
+            $ic = [System.Drawing.Icon]::ExtractAssociatedIcon($Src)
+            if ($ic) { return $ic.ToBitmap() }
+            return $null
+        }
+        return (ConvertTo-Bitmap ([System.IO.File]::ReadAllBytes($Src)))
+    } catch { return $null }
+}
+function ConvertTo-Bitmap([byte[]]$Bytes) {
+    if (-not $Bytes) { return $null }
+    try {
+        $ms = New-Object System.IO.MemoryStream(, $Bytes)
+        $img = [System.Drawing.Image]::FromStream($ms)
+        $bmp = New-Object System.Drawing.Bitmap($img)
+        $img.Dispose(); $ms.Dispose()
+        return $bmp
+    } catch { return $null }
+}
+function Get-AppIconKey($App) {
+    if ($App.Aumid) { return $App.Aumid }
+    if ($App.ExePath) { return $App.ExePath }
+    return "$($App.Exe)|$($App.LaunchOptions)"
 }
 function Get-AppIconIndex($App) {
-    # ogni icona viene estratta una volta sola e poi riusata
-    $key = if ($App.Aumid) { $App.Aumid } elseif ($App.ExePath) { $App.ExePath } else { "$($App.Exe)|$($App.LaunchOptions)" }
+    # ogni icona viene estratta una volta sola, ridotta a 20px e poi riusata
+    $key = Get-AppIconKey $App
     if ($null -ne $script:iconIndex[$key]) { return $script:iconIndex[$key] }
-    $img = $null
-    try {
-        $src = $null
-        if ($App.Kind -eq 'UWP') { $src = Get-UwpIcon $App $iconCache }
-        elseif ($App.Icon) { $src = $App.Icon }
-        elseif ($App.ExePath) { $src = $App.ExePath }
-        if ($src -and (Test-Path $src)) {
-            if ($src -like '*.exe' -or $src -like '*.ico') {
-                $ic = [System.Drawing.Icon]::ExtractAssociatedIcon($src)
-                if ($ic) { $img = $ic.ToBitmap() }
-            } else {
-                # carico i byte per non tenere bloccato il file
-                $ms = New-Object System.IO.MemoryStream(, [System.IO.File]::ReadAllBytes($src))
-                $img = [System.Drawing.Image]::FromStream($ms)
-            }
-        }
-    } catch { $img = $null }
+    $img = Get-IconBitmap (Get-AppIconSource $App)
     if (-not $img) { $script:iconIndex[$key] = -1; return -1 }
-    $script:imgList.Images.Add($img)
-    $img.Dispose()
-    $idx = $script:imgList.Images.Count - 1
+    $small = New-Object System.Drawing.Bitmap(20, 20)
+    $g = [System.Drawing.Graphics]::FromImage($small)
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.DrawImage($img, 0, 0, 20, 20); $g.Dispose()
+    $script:LargeIcons[$key] = $img          # l'originale serve all'anteprima
+    $idx = $script:iconBmps.Add($small)
     $script:iconIndex[$key] = $idx
     return $idx
 }
+$script:LargeIcons = @{}
 
-# I pulsanti stanno in un pannello che li dispone da solo: per aggiungerne uno
-# basta crearlo e metterlo nel pannello, senza ricalcolare le coordinate a mano.
+# disegno delle celle: righe alterne, pillole per la piattaforma, badge "In Steam"
+$script:PaintCell = {
+    param($s, $e)
+    $g = $e.Graphics
+    $app = $e.Item.Tag
+    $cell = $e.Bounds
+    if ($e.ColumnIndex -eq 0) { $cell = New-Object System.Drawing.Rectangle($cell.X, $cell.Y, $e.Header.Width, $cell.Height) }
+    $bgc = if ($e.Item.Selected) { $script:Th.Sel } elseif ($e.ItemIndex % 2 -eq 1) { $script:Th.RowAlt } else { $script:Th.Panel }
+    $br = New-Object System.Drawing.SolidBrush($bgc); $g.FillRectangle($br, $cell); $br.Dispose()
+    $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis -bor
+             [System.Windows.Forms.TextFormatFlags]::NoPrefix
+    switch ($e.ColumnIndex) {
+        0 {
+            # casella e icona negli stessi punti in cui ListView le cerca al clic
+            $ir = $e.Item.GetBounds([System.Windows.Forms.ItemBoundsPortion]::Icon)
+            if ($app.Kind -ne 'Steam') {      # i giochi Steam non si spuntano: niente casella
+                $chk = if ($e.Item.Checked) { $script:ChkOn } else { $script:ChkOff }
+                $cx = $cell.X + [int][Math]::Max(0, ($ir.Left - $cell.X - 16) / 2)
+                $g.DrawImage($chk, $cx, ($cell.Y + [int](($cell.Height - 16) / 2)), 16, 16)
+            }
+            $idx = Get-AppIconIndex $app
+            if ($idx -ge 0) {
+                $g.DrawImage($script:iconBmps[$idx], ($ir.X + [int](($ir.Width - 20) / 2)), ($cell.Y + [int](($cell.Height - 20) / 2)), 20, 20)
+            }
+            $tr = New-Object System.Drawing.Rectangle(($ir.Right + 4), $cell.Y, [Math]::Max(0, ($cell.Right - $ir.Right - 6)), $cell.Height)
+            $col = if (Test-InSteam $app) { $script:Th.InSteam } else { $script:Th.Text }
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $e.Item.Text, $s.Font, $tr, $col, $flags)
+        }
+        1 {
+            $c = if ($script:KindColor[$app.Kind]) { $script:KindColor[$app.Kind] } else { $script:Th.Sub }
+            Draw-Pill $g ([string]$app.Kind) $script:PillFont $cell $c
+        }
+        2 {
+            if (Test-InSteam $app) { Draw-Pill $g ([string][char]0x2713 + ' ' + (T 'Gia'' in Steam')) $script:PillFont $cell $script:Th.Ok }
+        }
+        3 {
+            # i percorsi lunghi si accorciano nel mezzo, cosi' resta visibile il nome dell'exe
+            $tr = New-Object System.Drawing.Rectangle(($cell.X + 6), $cell.Y, [Math]::Max(0, ($cell.Width - 10)), $cell.Height)
+            [System.Windows.Forms.TextRenderer]::DrawText($g, [string]$app.Detail, $s.Font, $tr, $script:Th.Sub,
+                ([System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::PathEllipsis -bor
+                 [System.Windows.Forms.TextFormatFlags]::NoPrefix))
+        }
+    }
+}
+
+# ---- pannello anteprima
+$pnlPrev = New-Object System.Windows.Forms.Panel
+$pnlPrev.Location = New-Object System.Drawing.Point(($W - 16 - $prevW), 82)
+$pnlPrev.Size = New-Object System.Drawing.Size($prevW, 426)
+$pnlPrev.Anchor = 'Top,Bottom,Right'
+$pnlPrev.Add_Paint({
+    param($s, $e)
+    $pen = New-Object System.Drawing.Pen($script:Th.Line)
+    $e.Graphics.DrawRectangle($pen, 0, 0, ($s.Width - 1), ($s.Height - 1)); $pen.Dispose()
+})
+
+$pnlCover = New-Object System.Windows.Forms.Panel
+$pnlCover.Size = '160,240'
+$pnlCover.Location = New-Object System.Drawing.Point([int](($prevW - 160) / 2), 16)
+$pnlCover.Anchor = 'Top'
+Set-DoubleBuffered $pnlCover
+$script:PrevCover = $null; $script:PrevIcon = $null; $script:PrevCoverMsg = ''
+$pnlCover.Add_Paint({
+    param($s, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.Clear($script:Th.Panel)
+    $r = New-Object System.Drawing.Rectangle(0, 0, ($s.Width - 1), ($s.Height - 1))
+    $path = New-RoundPath $r 10
+    $g.SetClip($path)
+    if ($script:PrevCover) {
+        # riempie il riquadro 2:3 mantenendo le proporzioni (i bordi in eccesso si tagliano)
+        $img = $script:PrevCover
+        $k = [Math]::Max($s.Width / $img.Width, $s.Height / $img.Height)
+        $w = $img.Width * $k; $h = $img.Height * $k
+        $g.DrawImage($img, [float](($s.Width - $w) / 2), [float](($s.Height - $h) / 2), [float]$w, [float]$h)
+    } else {
+        $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($r,
+            [System.Drawing.Color]::FromArgb(48, 34, 82), [System.Drawing.Color]::FromArgb(24, 24, 30), 90.0)
+        $g.FillRectangle($bg, $r); $bg.Dispose()
+        if ($script:PrevIcon) { $g.DrawImage($script:PrevIcon, [int](($s.Width - 48) / 2), 76, 48, 48) }
+        if ($script:PrevCoverMsg) {
+            $tr = New-Object System.Drawing.Rectangle(12, 136, ($s.Width - 24), 60)
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $script:PrevCoverMsg, $script:PillFont, $tr, $script:Th.Sub,
+                ([System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::WordBreak))
+        }
+    }
+    $g.ResetClip()
+    $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(74, 62, 108))
+    $g.DrawPath($pen, $path); $pen.Dispose(); $path.Dispose()
+})
+
+$lblPrevName = New-Object System.Windows.Forms.Label
+$lblPrevName.Location = '16,268'; $lblPrevName.Size = New-Object System.Drawing.Size(($prevW - 32), 44)
+$lblPrevName.AutoEllipsis = $true
+$lblPrevInfo = New-Object System.Windows.Forms.Label
+$lblPrevInfo.Location = '16,314'; $lblPrevInfo.Size = New-Object System.Drawing.Size(($prevW - 32), 20)
+$lblPrevCmdCap = New-Object System.Windows.Forms.Label
+$lblPrevCmdCap.Location = '16,342'; $lblPrevCmdCap.AutoSize = $true
+$txtPrevCmd = New-Object System.Windows.Forms.TextBox
+$txtPrevCmd.Multiline = $true; $txtPrevCmd.ReadOnly = $true; $txtPrevCmd.WordWrap = $true
+$txtPrevCmd.Location = '16,362'; $txtPrevCmd.Size = New-Object System.Drawing.Size(($prevW - 32), 50)
+$txtPrevCmd.Anchor = 'Top,Bottom,Left,Right'
+$pnlPrev.Controls.AddRange(@($pnlCover, $lblPrevName, $lblPrevInfo, $lblPrevCmdCap, $txtPrevCmd))
+
+# ---- barra comandi in basso: secondari a sinistra, azione principale a destra
 $pnlBtns = New-Object System.Windows.Forms.FlowLayoutPanel
-$pnlBtns.Location = '12,468'
-$pnlBtns.Size = New-Object System.Drawing.Size(780, 34)
+$pnlBtns.Location = '16,530'
+$pnlBtns.Size = New-Object System.Drawing.Size(($W - 32 - 246), 36)
 $pnlBtns.Anchor = 'Bottom,Left,Right'
 $pnlBtns.FlowDirection = 'LeftToRight'
 $pnlBtns.WrapContents = $false
 
-function New-BarButton([string]$Text, [int]$Width) {
+function New-BarButton([string]$Text, [int]$Glyph) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $Text
-    $b.Size = New-Object System.Drawing.Size($Width, 28)
-    $b.Margin = New-Object System.Windows.Forms.Padding(0, 2, 8, 2)
+    $b.Size = New-Object System.Drawing.Size(100, 32)
+    $b.Margin = New-Object System.Windows.Forms.Padding(0, 2, 6, 2)
+    $b.AccessibleDescription = [string]$Glyph     # codice dell'icona, applicata dopo il tema
     [void]$pnlBtns.Controls.Add($b)
     return $b
 }
-$btnExe     = New-BarButton (T 'Aggiungi .exe...') 110
-$btnRefresh = New-BarButton (T 'Ricarica') 80
-$btnArt     = New-BarButton (T 'Artwork / Copertine...') 150
-$btnUndo    = New-BarButton (T 'Annulla modifiche') 130
-$btnRemove  = New-BarButton (T 'Rimuovi...') 90
-$btnSteam   = New-BarButton (T 'Riavvia Steam') 122
+$btnExe     = New-BarButton (T 'Aggiungi .exe...') 0xE710
+$btnRefresh = New-BarButton (T 'Ricarica') 0xE72C
+$btnArt     = New-BarButton (T 'Copertine...') 0xEB9F
+$btnUndo    = New-BarButton (T 'Annulla modifiche') 0xE7A7
+$btnRemove  = New-BarButton (T 'Rimuovi...') 0xE74D
+$btnSteam   = New-BarButton (T 'Riavvia Steam') 0
+$script:BarButtons = @($btnExe, $btnRefresh, $btnArt, $btnUndo, $btnRemove, $btnSteam)
+function Fit-BarButtons {
+    # larghezza secondo il testo (cambia con la lingua) piu' lo spazio dell'icona
+    foreach ($b in $script:BarButtons) {
+        $tw = [System.Windows.Forms.TextRenderer]::MeasureText($b.Text, $b.Font).Width
+        $b.Width = $tw + $(if ($b.Tag -is [hashtable] -and $b.Tag.RImage) { 40 } else { 24 })
+    }
+}
 
 $lblKey = New-Object System.Windows.Forms.LinkLabel
 $lblKey.Text = T 'API key SteamGridDB (clicca qui per ottenerla gratis):'
 $lblKey.LinkArea = New-Object System.Windows.Forms.LinkArea(21, 10)
-$lblKey.Location = '12,510'; $lblKey.AutoSize = $true; $lblKey.Anchor = 'Bottom,Left'
+$lblKey.Location = '16,584'; $lblKey.AutoSize = $true; $lblKey.Anchor = 'Bottom,Left'
 $lblKey.Add_LinkClicked({ Start-Process 'https://www.steamgriddb.com/profile/preferences/api' })
 
 $txtKey = New-Object System.Windows.Forms.TextBox
-$txtKey.Location = '320,507'; $txtKey.Width = 180; $txtKey.Anchor = 'Bottom,Left'
+$txtKey.Location = '336,581'; $txtKey.Width = 200; $txtKey.Anchor = 'Bottom,Left'
 $txtKey.UseSystemPasswordChar = $true
 $txtKey.Text = (Get-SIConfig).SgdbApiKey
+# con una chiave nuova le copertine "non trovate" vanno ricercate
+$txtKey.Add_TextChanged({ $script:CoverCache = @{}; Update-Preview })
 
 $chkSaveKey = New-Object System.Windows.Forms.CheckBox
 $chkSaveKey.Text = T 'Salva'
-$chkSaveKey.Location = '508,509'; $chkSaveKey.AutoSize = $true; $chkSaveKey.Anchor = 'Bottom,Left'
+$chkSaveKey.Location = '546,583'; $chkSaveKey.AutoSize = $true; $chkSaveKey.Anchor = 'Bottom,Left'
 $chkSaveKey.Checked = [bool](Get-SIConfig).SgdbApiKey
 
 function Save-ApiKeyIfWanted {
@@ -1591,82 +2013,364 @@ function Save-ApiKeyIfWanted {
 
 $btnExport = New-Object System.Windows.Forms.Button
 $btnExport.Text = T 'Aggiungi a Steam'
-$btnExport.Location = '648,500'; $btnExport.Size = '144,34'; $btnExport.Anchor = 'Bottom,Right'
-$btnExport.Font = New-Object System.Drawing.Font($btnExport.Font, [System.Drawing.FontStyle]::Bold)
+$btnExport.Location = New-Object System.Drawing.Point(($W - 16 - 230), 527)
+$btnExport.Size = '230,42'; $btnExport.Anchor = 'Bottom,Right'
 
 $sep = New-Object System.Windows.Forms.Panel
-$sep.Location = '12,458'; $sep.Size = '780,1'; $sep.Anchor = 'Bottom,Left,Right'
+$sep.Location = '16,518'; $sep.Size = New-Object System.Drawing.Size(($W - 32), 1); $sep.Anchor = 'Bottom,Left,Right'
 
+# ---- barra di stato con avanzamento
 $pnlStatus = New-Object System.Windows.Forms.Panel
 $pnlStatus.Dock = 'Bottom'; $pnlStatus.Height = 30
 $status = New-Object System.Windows.Forms.Label
-$status.Dock = 'Fill'; $status.TextAlign = 'MiddleLeft'
-$status.Padding = New-Object System.Windows.Forms.Padding(12, 0, 12, 0)
+$status.Dock = 'Fill'; $status.TextAlign = 'MiddleLeft'; $status.AutoEllipsis = $true
+$status.Padding = New-Object System.Windows.Forms.Padding(16, 0, 12, 0)
 $status.Text = T 'Pronto.'
+$script:Prog = 0.0
+$pnlProg = New-Object System.Windows.Forms.Panel
+$pnlProg.Dock = 'Right'; $pnlProg.Width = 280; $pnlProg.Visible = $false
+Set-DoubleBuffered $pnlProg
+$pnlProg.Add_Paint({
+    param($s, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $track = New-Object System.Drawing.Rectangle(8, [int](($s.Height - 8) / 2), ($s.Width - 26), 8)
+    $p = New-RoundPath $track 4
+    $br = New-Object System.Drawing.SolidBrush($script:Th.BtnBg); $g.FillPath($br, $p); $br.Dispose(); $p.Dispose()
+    $fw = [int]($track.Width * [Math]::Min(1.0, [Math]::Max(0.0, $script:Prog)))
+    if ($fw -ge 8) {
+        $fill = New-Object System.Drawing.Rectangle($track.X, $track.Y, $fw, $track.Height)
+        $p = New-RoundPath $fill 4
+        $gb = New-Object System.Drawing.Drawing2D.LinearGradientBrush($track, $script:Th.Accent, $script:Th.AccentHover, 0.0)
+        $g.FillPath($gb, $p); $gb.Dispose(); $p.Dispose()
+    }
+})
 $pnlStatus.Controls.Add($status)
+$pnlStatus.Controls.Add($pnlProg)
+$status.BringToFront()          # il riempitivo va disposto per ultimo
 
+# ---------------------------------------------------------------- stato e lista
 $script:allApps = @()
 $script:inSteam = @{}
 $script:scanErrors = @()
+$script:SortCol = -1; $script:SortDesc = $false
+$script:Filling = $false
+$script:Busy = $false
+$script:ListCount = 0; $script:InSteamCount = 0
+
 function Refresh-ExistingMap {
     $script:inSteam = @{}
     if ($cmbAcc.SelectedIndex -ge 0) {
         try { $script:inSteam = Get-ExistingShortcutMap -SteamPath $steamPath -AccountId $accounts[$cmbAcc.SelectedIndex].Id } catch {}
     }
 }
-function Update-List {
-    $list.BeginUpdate()
-    $list.Items.Clear()
-    $f = $txtFilter.Text.Trim()
-    $added = 0
-    foreach ($app in $script:allApps) {
-        if (-not $chkAll.Checked -and $app.Kind -eq 'UWP' -and ($app.Pfn -like 'Microsoft.*' -or $app.Pfn -like 'MicrosoftWindows.*' -or $app.Pfn -like 'MicrosoftCorporationII.*' -or $app.Pfn -like 'windows.*')) { continue }
-        if ($f -and $app.Name -notlike "*$f*") { continue }
-        $sig = Get-AppSignature $app
-        $ex = if ($sig -and $script:inSteam[$sig]) { $script:inSteam[$sig] } else { $null }
-        $app | Add-Member -NotePropertyName VdfKey -NotePropertyValue $(if ($ex) { [string]$ex.Key } else { $null }) -Force
-        $item = New-Object System.Windows.Forms.ListViewItem($app.Name)
-        $item.UseItemStyleForSubItems = $false      # ogni colonna col suo colore
-        $item.ImageIndex = Get-AppIconIndex $app
-        $item.ForeColor = if ($ex) { [System.Drawing.Color]::FromArgb(196, 160, 255) } else { $script:Th.Text }
-        $sKind = $item.SubItems.Add($app.Kind)
-        $sKind.ForeColor = if ($script:KindColor[$app.Kind]) { $script:KindColor[$app.Kind] } else { $script:Th.Sub }
-        $sChk = $item.SubItems.Add($(if ($ex) { [string][char]0x2713 } else { '' }))
-        $sChk.ForeColor = [System.Drawing.Color]::FromArgb(110, 205, 140)
-        $sDet = $item.SubItems.Add([string]$app.Detail)
-        $sDet.ForeColor = $script:Th.Sub
-        if ($ex) { $added++ }
-        $item.Tag = $app
-        [void]$list.Items.Add($item)
+function New-ListApp($Props) {
+    # ogni app della lista ricorda selezione e nome scelto anche quando filtri e ordinamento la nascondono
+    $o = if ($Props -is [System.Collections.IDictionary]) { [pscustomobject]$Props } else { $Props }
+    $o | Add-Member -NotePropertyName Selected -NotePropertyValue $false -Force
+    $o | Add-Member -NotePropertyName OrigName -NotePropertyValue $o.Name -Force
+    $o | Add-Member -NotePropertyName VdfKey -NotePropertyValue $null -Force
+    $o | Add-Member -NotePropertyName SteamAppId -NotePropertyValue $null -Force
+    return $o
+}
+function Update-ColumnHeaders {
+    $names = @((T 'Nome (doppio click per rinominare)'), (T 'Piattaforma'), (T 'Stato'), (T 'Percorso'))
+    for ($i = 0; $i -lt $names.Count; $i++) {
+        $t = $names[$i]
+        if ($i -eq $script:SortCol) { $t += ' ' + $(if ($script:SortDesc) { [char]0x25BC } else { [char]0x25B2 }) }
+        $list.Columns[$i].Text = $t
     }
-    $list.EndUpdate()
-    Update-LastColumn $list
-    $msg = (T '{0} app in elenco - {1} gia'' in Steam (in viola).') -f $list.Items.Count, $added
+}
+function Update-Chips($Counts) {
+    foreach ($d in $script:ChipDefs) {
+        $b = $script:Chips[$d.Key]
+        $b.Text = '{0}  {1}' -f (T $d.Text), $Counts[$d.Key]
+        if ($b.Tag -is [hashtable]) {
+            $on = $script:KindFilter -eq $d.Key
+            $b.Tag.Radius = 12
+            $b.Tag.RFill = if ($on) { [System.Drawing.Color]::FromArgb(62, 40, 114) } else { $script:Th.Panel }
+            $b.Tag.RHover = if ($on) { [System.Drawing.Color]::FromArgb(76, 50, 136) } else { $script:Th.BtnBg }
+            $b.Tag.RBorder = if ($on) { $script:Th.Accent } else { $script:Th.Line }
+            $b.Tag.RText = if ($on) { [System.Drawing.Color]::White } else { $script:Th.Sub }
+        }
+        $b.Invalidate()
+    }
+}
+function Update-SelectionInfo {
+    $n = @($script:allApps | Where-Object { $_.Selected }).Count
+    $btnExport.Text = if ($n -gt 0) { (T 'Aggiungi {0} app a Steam') -f $n } else { T 'Aggiungi a Steam' }
+    $btnExport.Invalidate()
+    $msg = (T '{0} app in elenco - {1} gia'' in Steam - {2} selezionate.') -f $script:ListCount, $script:InSteamCount, $n
     if ($script:scanErrors.Count -gt 0) { $msg += (T '  Scansione fallita per: {0}') -f ($script:scanErrors -join '; ') }
     $status.Text = $msg
+}
+function Update-List {
+    $f = $txtFilter.Text.Trim()
+    $counts = @{ all = 0; games = 0; uwp = 0; apps = 0 }
+    $rows = New-Object System.Collections.ArrayList
+    $inSteamCount = 0
+    foreach ($app in $script:allApps) {
+        $sig = Get-AppSignature $app
+        $ex = if ($sig -and $script:inSteam[$sig]) { $script:inSteam[$sig] } else { $null }
+        $app.VdfKey = if ($ex) { [string]$ex.Key } else { $null }
+        $app.SteamAppId = if ($ex) { $ex.AppId } else { $null }
+        if (-not $chkAll.Checked -and (Test-SystemApp $app)) { continue }
+        if ($f -and $app.Name -notlike "*$f*") { continue }
+        $inS = Test-InSteam $app
+        if ($inS) { $inSteamCount++ }
+        if ($chkHide.Checked -and $inS) { continue }
+        $grp = Get-KindGroup $app.Kind
+        $counts.all++; $counts[$grp]++
+        if ($script:KindFilter -ne 'all' -and $grp -ne $script:KindFilter) { continue }
+        [void]$rows.Add($app)
+    }
+    $rows = @($rows)
+    if ($script:SortCol -ge 0) {
+        $by = switch ($script:SortCol) {
+            0 { { $_.Name } }
+            1 { { $_.Kind } }
+            2 { { Test-InSteam $_ } }
+            default { { [string]$_.Detail } }
+        }
+        $rows = @($rows | Sort-Object -Property $by -Descending:$script:SortDesc)
+    }
+    $selKey = if ($script:PrevApp) { $script:PrevApp } else { $null }
+    $script:Filling = $true
+    $list.BeginUpdate()
+    $list.Items.Clear()
+    foreach ($app in $rows) {
+        $item = New-Object System.Windows.Forms.ListViewItem([string]$app.Name)
+        [void]$item.SubItems.Add([string]$app.Kind)
+        [void]$item.SubItems.Add($(if (Test-InSteam $app) { T 'Gia'' in Steam' } else { '' }))
+        [void]$item.SubItems.Add([string]$app.Detail)
+        $item.Tag = $app
+        $item.Checked = [bool]$app.Selected
+        [void]$list.Items.Add($item)
+        if ($selKey -and [object]::ReferenceEquals($app, $selKey)) { $item.Selected = $true }
+    }
+    $list.EndUpdate()
+    $script:Filling = $false
+    Update-LastColumn $list
+    $script:ListCount = $list.Items.Count
+    $script:InSteamCount = $inSteamCount
+    Update-Chips $counts
+    Update-SelectionInfo
+    Update-Preview
 }
 function Reload-Apps {
     $status.Text = T 'Scansione app installate (UWP, Battle.net, Epic, GOG, Ubisoft, menu Start)...'
     $form.Refresh()
+    # selezioni, nomi cambiati e .exe aggiunti a mano sopravvivono alla nuova scansione
+    $prev = @{}
+    foreach ($a in $script:allApps) { $s = Get-AppSignature $a; if ($s) { $prev[$s] = $a } }
     $apps = @()
     $apps += @(Get-UwpApps | ForEach-Object {
-        [pscustomobject]@{ Name = $_.Name; Kind = 'UWP'; Detail = $_.Aumid; Aumid = $_.Aumid; Pfn = $_.Pfn; InstallDir = $_.InstallDir; ExePath = $null; Exe = $null; StartDir = $null; LaunchOptions = $null; Icon = $null }
+        New-ListApp @{ Name = $_.Name; Kind = 'UWP'; Detail = $_.Aumid; Aumid = $_.Aumid; Pfn = $_.Pfn; InstallDir = $_.InstallDir; ExePath = $null; Exe = $null; StartDir = $null; LaunchOptions = $null; Icon = $null }
     })
     $script:scanErrors = @()
-    foreach ($scanner in 'Get-BattleNetGames', 'Get-EpicGames', 'Get-GogGames', 'Get-UbisoftGames', 'Get-StartMenuPrograms') {
-        try { $apps += @(& $scanner) }
+    foreach ($scanner in 'Get-BattleNetGames', 'Get-EpicGames', 'Get-GogGames', 'Get-UbisoftGames', 'Get-StartMenuPrograms', 'Get-SteamGames') {
+        try { $apps += @(& $scanner | ForEach-Object { New-ListApp $_ }) }
         catch { $script:scanErrors += "$($scanner -replace '^Get-|Games$|Programs$', '') ($($_.Exception.Message))" }
     }
+    $apps += @($script:allApps | Where-Object { $_.Kind -eq 'EXE' })
+    foreach ($a in $apps) {
+        $s = Get-AppSignature $a
+        $old = if ($s) { $prev[$s] } else { $null }
+        if ($old -and -not [object]::ReferenceEquals($old, $a)) {
+            $a.Selected = $old.Selected
+            if ($old.Name -ne $old.OrigName) { $a.Name = $old.Name }
+        }
+    }
     # i giochi dei launcher prima, poi UWP e app generiche, in ordine alfabetico
-    $order = @{ 'Battle.net' = 0; 'Epic' = 0; 'GOG' = 0; 'Ubisoft' = 0; 'UWP' = 1; 'App' = 2; 'EXE' = 2 }
+    $order = @{ 'Battle.net' = 0; 'Epic' = 0; 'GOG' = 0; 'Ubisoft' = 0; 'Google Play' = 0; 'Launcher' = 0; 'UWP' = 1; 'App' = 2; 'EXE' = 2; 'Steam' = 3 }
     $script:allApps = @($apps | Sort-Object { $order[$_.Kind] }, Name)
+    $script:PrevApp = $null
     Refresh-ExistingMap
     Update-List
 }
 
+# ---------------------------------------------------------------- anteprima e copertine
+$script:PrevApp = $null
+$script:CoverCache = @{}          # nome in minuscolo -> byte della copertina ($null = non trovata)
+$script:CoverWanted = $null
+$script:CoverJobs = New-Object System.Collections.ArrayList
+# gira in un runspace separato: la finestra resta reattiva mentre SteamGridDB risponde
+$script:CoverFetchScript = {
+    param($Key, $Name)
+    $h = @{ Authorization = "Bearer $Key" }
+    try {
+        $q = [uri]::EscapeDataString($Name)
+        $r = Invoke-RestMethod -Uri "https://www.steamgriddb.com/api/v2/search/autocomplete/$q" -Headers $h -TimeoutSec 15
+        if (-not $r.success -or $r.data.Count -eq 0) { return $null }
+        $gid = $r.data[0].id
+        $gr = Invoke-RestMethod -Uri "https://www.steamgriddb.com/api/v2/grids/game/$($gid)?dimensions=600x900&mimes=image/png,image/jpeg" -Headers $h -TimeoutSec 15
+        if (-not $gr.success -or $gr.data.Count -eq 0) { return $null }
+        $u = if ($gr.data[0].thumb) { $gr.data[0].thumb } else { $gr.data[0].url }
+        return , (New-Object System.Net.WebClient).DownloadData($u)
+    } catch { return $null }
+}
+function Set-PrevCover($Bmp) {
+    if ($script:PrevCover -and -not [object]::ReferenceEquals($script:PrevCover, $Bmp)) { $script:PrevCover.Dispose() }
+    $script:PrevCover = $Bmp
+    $pnlCover.Invalidate()
+}
+function Find-LocalCover($App) {
+    # copertina gia' presente in Steam: grid dell'account (anche personalizzata), poi la cache di Steam
+    $id = if ($App.Kind -eq 'Steam') { $App.SteamGameId } else { $App.SteamAppId }
+    if ($null -eq $id) { return $null }
+    if ($cmbAcc.SelectedIndex -ge 0) {
+        $grid = Join-Path $steamPath "userdata\$($accounts[$cmbAcc.SelectedIndex].Id)\config\grid"
+        foreach ($ext in '.png', '.jpg', '.jpeg') {
+            $p = Join-Path $grid ("{0}p{1}" -f $id, $ext)
+            if (Test-Path $p) { return $p }
+        }
+    }
+    if ($App.Kind -eq 'Steam') { return (Find-SteamCacheImage $steamPath $id 'cover') }
+    return $null
+}
+function Update-Preview {
+    if ($script:Busy) { return }      # durante l'aggiunta l'anteprima mostra l'avanzamento
+    $app = if ($list.SelectedItems.Count -gt 0) { $list.SelectedItems[0].Tag } else { $null }
+    $script:PrevApp = $app
+    $script:CoverWanted = $null
+    Set-PrevCover $null
+    $script:PrevIcon = $null
+    if (-not $app) {
+        $lblPrevName.Text = T 'Seleziona un''app per vedere l''anteprima.'
+        $lblPrevName.ForeColor = $script:Th.Sub
+        $lblPrevInfo.Text = ''
+        $lblPrevCmdCap.Visible = $false; $txtPrevCmd.Visible = $false
+        $script:PrevCoverMsg = ''
+        $pnlCover.Invalidate()
+        return
+    }
+    $lblPrevName.Text = $app.Name
+    $lblPrevName.ForeColor = $script:Th.Text
+    $inS = Test-InSteam $app
+    $lblPrevInfo.Text = '{0}  {1}  {2}' -f $app.Kind, [char]0x00B7, $(if ($inS) { T 'Gia'' in Steam' } else { T 'Non ancora in Steam' })
+    $lblPrevInfo.ForeColor = if ($inS) { $script:Th.Ok } else { $script:Th.Sub }
+    $parts = Get-AppLaunchParts $app
+    $txtPrevCmd.Text = if ($parts) { ('{0} {1}' -f $parts[0], $parts[1]).Trim() } else { '' }
+    $lblPrevCmdCap.Visible = $true; $txtPrevCmd.Visible = $true
+    [void](Get-AppIconIndex $app)
+    $script:PrevIcon = $script:LargeIcons[(Get-AppIconKey $app)]
+    # 1) copertina gia' in Steam  2) gia' cercata  3) ricerca su SteamGridDB in background
+    $local = Find-LocalCover $app
+    if ($local) { Set-PrevCover (ConvertTo-Bitmap ([System.IO.File]::ReadAllBytes($local))); return }
+    $nk = $app.Name.ToLower()
+    if ($script:CoverCache.ContainsKey($nk)) {
+        $bmp = ConvertTo-Bitmap $script:CoverCache[$nk]
+        $script:PrevCoverMsg = if ($bmp) { '' } else { T 'Nessuna copertina trovata' }
+        Set-PrevCover $bmp
+    } elseif ($txtKey.Text.Trim()) {
+        $script:PrevCoverMsg = T 'Cerco la copertina...'
+        $script:CoverWanted = @{ Name = $app.Name; At = [DateTime]::Now }
+    } else {
+        $script:PrevCoverMsg = T 'Inserisci la API key per vedere la copertina'
+    }
+    $pnlCover.Invalidate()
+}
+$coverTimer = New-Object System.Windows.Forms.Timer
+$coverTimer.Interval = 120
+$coverTimer.Add_Tick({
+    # piccola pausa prima di cercare: scorrendo la lista con le frecce non parte una richiesta per riga
+    $w = $script:CoverWanted
+    if ($w -and ([DateTime]::Now - $w.At).TotalMilliseconds -ge 350) {
+        $script:CoverWanted = $null
+        $nk = $w.Name.ToLower()
+        $running = @($script:CoverJobs | Where-Object { $_.Key -eq $nk }).Count -gt 0
+        if (-not $running -and -not $script:CoverCache.ContainsKey($nk)) {
+            $ps = [PowerShell]::Create()
+            [void]$ps.AddScript($script:CoverFetchScript).AddArgument($txtKey.Text.Trim()).AddArgument($w.Name)
+            [void]$script:CoverJobs.Add(@{ Key = $nk; PS = $ps; Handle = $ps.BeginInvoke() })
+        }
+    }
+    foreach ($j in @($script:CoverJobs)) {
+        if (-not $j.Handle.IsCompleted) { continue }
+        $bytes = $null
+        try {
+            $out = $j.PS.EndInvoke($j.Handle)
+            if ($out.Count -gt 0 -and $out[0]) { $bytes = [byte[]]$out[0].BaseObject }
+        } catch {}
+        $j.PS.Dispose()
+        $script:CoverJobs.Remove($j)
+        $script:CoverCache[$j.Key] = $bytes
+        if ($script:PrevApp -and $script:PrevApp.Name.ToLower() -eq $j.Key) { Update-Preview }
+    }
+})
+
+# ---------------------------------------------------------------- eventi della lista
+$list.Add_SelectedIndexChanged({ Update-Preview })
+$list.Add_ItemChecked({
+    param($s, $e)
+    if ($script:Filling) { return }
+    $e.Item.Tag.Selected = $e.Item.Checked
+    Update-SelectionInfo
+})
+# doppio clic sul nome = rinomina, senza che la casella cambi stato
+$script:SkipCheck = $false
+$list.Add_MouseDown({
+    param($s, $e)
+    $hit = $s.HitTest($e.Location)
+    $script:SkipCheck = ($e.Clicks -gt 1 -and $hit.Location -ne [System.Windows.Forms.ListViewHitTestLocations]::StateImage)
+})
+$list.Add_ItemCheck({
+    param($s, $e)
+    if ($script:SkipCheck -or $s.Items[$e.Index].Tag.Kind -eq 'Steam') { $e.NewValue = $e.CurrentValue }
+})
+$list.Add_MouseDoubleClick({
+    param($s, $e)
+    $hit = $s.HitTest($e.Location)
+    if ($hit.Item -and $hit.Location -ne [System.Windows.Forms.ListViewHitTestLocations]::StateImage) { $hit.Item.BeginEdit() }
+    $script:SkipCheck = $false
+})
+$list.Add_AfterLabelEdit({
+    param($s, $e)
+    $nuovo = if ($e.Label) { $e.Label.Trim() } else { '' }
+    if (-not $nuovo) { $e.CancelEdit = $true; return }
+    $s.Items[$e.Item].Tag.Name = $nuovo
+    $lblPrevName.Text = $nuovo
+})
+$list.Add_ColumnClick({
+    param($s, $e)
+    # crescente -> decrescente -> ordine originale
+    if ($script:SortCol -eq $e.Column) {
+        if ($script:SortDesc) { $script:SortCol = -1; $script:SortDesc = $false } else { $script:SortDesc = $true }
+    } else { $script:SortCol = $e.Column; $script:SortDesc = $false }
+    Update-ColumnHeaders
+    Update-List
+})
+$list.Add_Resize({ Update-LastColumn $list })
+
 $txtFilter.Add_TextChanged({ Update-List })
 $chkAll.Add_CheckedChanged({ Update-List })
+$chkHide.Add_CheckedChanged({ Update-List })
 $btnRefresh.Add_Click({ Reload-Apps })
+$lnkSel.Add_LinkClicked({
+    # spunta i giochi visibili che non sono ancora in Steam
+    foreach ($it in $list.Items) {
+        if ((Get-KindGroup $it.Tag.Kind) -eq 'games' -and -not (Test-InSteam $it.Tag)) { $it.Checked = $true }
+    }
+})
+$lnkNone.Add_LinkClicked({
+    foreach ($a in $script:allApps) { $a.Selected = $false }
+    $script:Filling = $true
+    foreach ($it in $list.Items) { $it.Checked = $false }
+    $script:Filling = $false
+    Update-SelectionInfo
+})
+
+function Set-Busy([bool]$On) {
+    # durante l'aggiunta i comandi sono spenti: la finestra si ridisegna ma non accetta altre azioni
+    $script:Busy = $On
+    foreach ($c in @($cmbAcc, $txtFilter, $chkAll, $chkHide, $pnlChips, $pnlLinks, $list, $pnlBtns, $txtKey, $chkSaveKey, $btnExport)) {
+        $c.Enabled = -not $On
+    }
+    foreach ($b in $script:BarButtons + @($script:Chips.Values)) { $b.Invalidate() }
+    $pnlProg.Visible = $On
+    $form.Cursor = if ($On) { [System.Windows.Forms.Cursors]::WaitCursor } else { [System.Windows.Forms.Cursors]::Default }
+}
+$form.Add_FormClosing({ param($s, $e) if ($script:Busy) { $e.Cancel = $true } })
 
 $btnUndo.Add_Click({
     if ($cmbAcc.SelectedIndex -lt 0) { return }
@@ -1697,6 +2401,7 @@ $btnArt.Add_Click({
     if ($cmbAcc.SelectedIndex -lt 0) { return }
     Save-ApiKeyIfWanted
     Show-ArtworkManager -SteamPath $steamPath -AccountId $accounts[$cmbAcc.SelectedIndex].Id -ApiKey $txtKey.Text.Trim()
+    Update-Preview      # le copertine scelte compaiono subito nell'anteprima
 })
 
 function Apply-Language {
@@ -1705,24 +2410,25 @@ function Apply-Language {
     $script:HeaderLabel.Text = 'SteamImporter'
     $lblAcc.Text = T 'Account Steam:'
     $chkAll.Text = T 'Mostra anche app di sistema'
-    $list.Columns[0].Text = T 'Nome (doppio click per rinominare)'
-    $list.Columns[1].Text = T 'Tipo'
-    $list.Columns[2].Text = T 'In Steam'
-    $list.Columns[3].Text = T 'Dettaglio'
+    $chkHide.Text = T 'Nascondi gia'' in Steam'
+    $lnkSel.Text = T 'Seleziona i giochi'
+    $lnkNone.Text = T 'Deseleziona tutto'
+    Update-ColumnHeaders
     $btnExe.Text     = T 'Aggiungi .exe...'
     $btnRefresh.Text = T 'Ricarica'
-    $btnArt.Text     = T 'Artwork / Copertine...'
+    $btnArt.Text     = T 'Copertine...'
     $btnUndo.Text    = T 'Annulla modifiche'
     $btnRemove.Text  = T 'Rimuovi...'
     $btnSteam.Text   = T 'Riavvia Steam'
-    $btnExport.Text  = T 'Aggiungi a Steam'
+    $lblPrevCmdCap.Text = T 'Comando di avvio'
     $lblKey.Text = T 'API key SteamGridDB (clicca qui per ottenerla gratis):'
     # in entrambe le lingue la parte cliccabile sono 10 caratteri dopo i primi 21
     $lblKey.LinkArea = New-Object System.Windows.Forms.LinkArea(21, 10)
     $chkSaveKey.Text = T 'Salva'
     try { [SINative]::SendMessage($txtFilter.Handle, 0x1501, [IntPtr]1, (T 'cerca...')) | Out-Null } catch {}
+    Fit-BarButtons
     # i pulsanti sono disegnati a mano: vanno ridisegnati dopo il cambio testo
-    foreach ($b in @($btnExe, $btnRefresh, $btnArt, $btnUndo, $btnRemove, $btnSteam, $btnExport)) { $b.Invalidate() }
+    foreach ($b in $script:BarButtons + @($btnExport)) { $b.Invalidate() }
     Update-LangSwitch
 }
 function Update-LangSwitch {
@@ -1732,7 +2438,7 @@ function Update-LangSwitch {
     $script:LblEng.ForeColor = if ($script:Lang -eq 'en') { [System.Drawing.Color]::White } else { $script:Th.Sub }
 }
 function Set-Lang([string]$Nuova) {
-    if ($script:Lang -eq $Nuova) { return }
+    if ($script:Lang -eq $Nuova -or $script:Busy) { return }
     $script:Lang = $Nuova
     $cfg = Get-SIConfig
     $cfg.Lang = $Nuova
@@ -1792,7 +2498,7 @@ $btnSteam.Add_Click({
 $btnRemove.Add_Click({
     if ($cmbAcc.SelectedIndex -lt 0) { return }
     # le app spuntate che risultano gia' in Steam arrivano gia' selezionate nella finestra di rimozione
-    $pre = @($list.Items | Where-Object { $_.Checked -and $_.Tag.VdfKey } | ForEach-Object { [string]$_.Tag.VdfKey })
+    $pre = @($script:allApps | Where-Object { $_.Selected -and $_.VdfKey } | ForEach-Object { [string]$_.VdfKey })
     Show-RemoveManager -SteamPath $steamPath -AccountId $accounts[$cmbAcc.SelectedIndex].Id -PreselectKeys $pre
     Refresh-ExistingMap
     Update-List
@@ -1804,17 +2510,19 @@ $btnExe.Add_Click({
     $dlg.Title = T 'Scegli il programma da aggiungere a Steam'
     if ($dlg.ShowDialog() -eq 'OK') {
         $name = [System.IO.Path]::GetFileNameWithoutExtension($dlg.FileName)
-        $script:allApps = @($script:allApps) + [pscustomobject]@{
+        $new = New-ListApp @{
             Name = $name; Kind = 'EXE'; Detail = $dlg.FileName; Aumid = $null; Pfn = $null; InstallDir = $null; ExePath = $dlg.FileName; Exe = $null; StartDir = $null; LaunchOptions = $null; Icon = $null
         }
+        $new.Selected = $true
+        $script:allApps = @($script:allApps) + $new
+        $script:PrevApp = $new
         Update-List
-        foreach ($it in $list.Items) { if ($it.Tag.ExePath -eq $dlg.FileName) { $it.Checked = $true } }
     }
 })
 
 $btnExport.Add_Click({
-    $checked = @($list.Items | Where-Object { $_.Checked })
-    if ($checked.Count -eq 0) {
+    $sel = @($script:allApps | Where-Object { $_.Selected -and $_.Kind -ne 'Steam' })
+    if ($sel.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show((T 'Seleziona almeno una app (spunta la casella).'), 'SteamImporter') | Out-Null
         return
     }
@@ -1824,70 +2532,120 @@ $btnExport.Add_Click({
     }
     if (-not (Confirm-CloseSteam $steamPath 'SteamImporter')) { return }
     $acc = $accounts[$cmbAcc.SelectedIndex]
-    $items = @()
-    $status.Text = T 'Estrazione icone...'
-    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    $form.Refresh()
-    foreach ($it in $checked) {
-        $app = $it.Tag
-        $icon = if ($app.Kind -eq 'UWP') { Get-UwpIcon $app $iconCache } else { $app.Icon }
-        $items += [pscustomobject]@{
-            Name = $it.Text; Kind = $app.Kind; Aumid = $app.Aumid; ExePath = $app.ExePath
-            Exe = $app.Exe; StartDir = $app.StartDir; LaunchOptions = $app.LaunchOptions; Icon = $icon
-        }
-    }
-    $status.Text = (T 'Scrittura shortcuts.vdf') + $(if ($txtKey.Text) { T ' e download artwork...' } else { '...' })
-    $form.Refresh()
+    $hasKey = [bool]$txtKey.Text.Trim()
     Save-ApiKeyIfWanted
+    Set-Busy $true
     try {
-        $res = Export-ToSteam -SteamPath $steamPath -AccountId $acc.Id -Items $items -SgdbApiKey $txtKey.Text.Trim()
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        # 10% della barra per le icone, il resto per scrittura e artwork
+        $items = @()
+        $n = $sel.Count; $i = 0
+        foreach ($app in $sel) {
+            $i++
+            $status.Text = (T 'Estrazione icone...') + " ($i/$n)"
+            $script:Prog = 0.1 * $i / $n; $pnlProg.Invalidate()
+            [System.Windows.Forms.Application]::DoEvents()
+            $icon = if ($app.Kind -eq 'UWP') { Get-UwpIcon $app $iconCache } else { $app.Icon }
+            $items += [pscustomobject]@{
+                Name = $app.Name; Kind = $app.Kind; Aumid = $app.Aumid; ExePath = $app.ExePath
+                Exe = $app.Exe; StartDir = $app.StartDir; LaunchOptions = $app.LaunchOptions; Icon = $icon
+            }
+        }
+        $onProgress = {
+            param($Phase, $Item, $Index, $Total, $CoverPath)
+            switch ($Phase) {
+                'skip' { $status.Text = (T '({0}/{1}) {2} - gia'' presente, salto') -f $Index, $Total, $Item.Name }
+                'item' {
+                    $status.Text = if ($hasKey) { (T '({0}/{1}) {2} - scarico gli artwork...') -f $Index, $Total, $Item.Name }
+                                   else { (T '({0}/{1}) {2}') -f $Index, $Total, $Item.Name }
+                    # l'anteprima segue l'app in lavorazione
+                    $lblPrevName.Text = $Item.Name; $lblPrevName.ForeColor = $script:Th.Text
+                    $lblPrevInfo.Text = $Item.Kind; $lblPrevInfo.ForeColor = $script:Th.Sub
+                    $txtPrevCmd.Visible = $false; $lblPrevCmdCap.Visible = $false
+                    $script:PrevIcon = Get-IconBitmap $(if ($Item.Icon) { $Item.Icon } else { $Item.ExePath })
+                    $script:PrevCoverMsg = if ($hasKey) { T 'Cerco la copertina...' } else { '' }
+                    Set-PrevCover $null
+                }
+                'done' {
+                    if ($CoverPath) { Set-PrevCover (ConvertTo-Bitmap ([System.IO.File]::ReadAllBytes($CoverPath))) }
+                    $lblPrevInfo.Text = '{0}  {1}  {2}' -f $Item.Kind, [char]0x00B7, (T 'Gia'' in Steam')
+                    $lblPrevInfo.ForeColor = $script:Th.Ok
+                }
+            }
+            $fatti = if ($Phase -eq 'item') { $Index - 1 } else { $Index }
+            $script:Prog = 0.1 + 0.9 * $fatti / [Math]::Max(1, $Total)
+            $pnlProg.Invalidate()
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        $res = Export-ToSteam -SteamPath $steamPath -AccountId $acc.Id -Items $items -SgdbApiKey $txtKey.Text.Trim() -OnProgress $onProgress
+        $script:Prog = 1.0; $pnlProg.Invalidate()
         $msg = (T 'Aggiunte: {0}  -  Gia'' presenti (saltate): {1}') -f $res.Added, $res.Skipped
-        if ($txtKey.Text) { $msg += (T '  -  Artwork scaricati: {0}') -f $res.Artwork }
+        if ($hasKey) { $msg += (T '  -  Artwork scaricati: {0}') -f $res.Artwork }
+        Set-Busy $false
+        foreach ($a in $sel) { $a.Selected = $false }
+        Refresh-ExistingMap
+        Update-List
         $status.Text = $msg
         [System.Windows.Forms.MessageBox]::Show(
             ((T '{0}{1}{1}E'' stato creato un backup di shortcuts.vdf.{1}Riavvia Steam per vedere le nuove app nella libreria.') -f $msg, "`n"),
             'SteamImporter', 'OK', 'Information') | Out-Null
-        Refresh-ExistingMap
-        Update-List
     } catch {
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        Set-Busy $false
         $status.Text = (T 'Errore: {0}') -f $_
         [System.Windows.Forms.MessageBox]::Show(((T 'Errore durante l''export:{0}{1}') -f "`n", $_), 'SteamImporter', 'OK', 'Error') | Out-Null
+    } finally {
+        if ($script:Busy) { Set-Busy $false }
     }
 })
 
-$form.Controls.AddRange(@($lblAcc, $cmbAcc, $txtFilter, $chkAll, $list, $sep, $pnlBtns, $lblKey, $txtKey, $chkSaveKey, $btnExport, $pnlStatus))
+$form.Controls.AddRange(@($lblAcc, $cmbAcc, $txtFilter, $chkAll, $pnlChips, $chkHide, $pnlLinks, $list, $pnlPrev,
+    $sep, $pnlBtns, $lblKey, $txtKey, $chkSaveKey, $btnExport, $pnlStatus))
 Apply-Theme $form
-$pnlBtns.BackColor = $script:Th.Bg
-$sep.BackColor = [System.Drawing.Color]::FromArgb(44, 44, 52)
+# ritocchi dopo il tema: pannelli trasparenti sullo sfondo, anteprima sul colore della lista
+foreach ($p in @($pnlBtns, $pnlChips, $pnlLinks)) { $p.BackColor = $script:Th.Bg }
+$pnlPrev.BackColor = $script:Th.Panel
+foreach ($c in @($lblPrevName, $lblPrevInfo, $lblPrevCmdCap)) { $c.BackColor = $script:Th.Panel }
+$lblPrevName.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11.5)
+$lblPrevCmdCap.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
+$lblPrevCmdCap.ForeColor = $script:Th.Sub
+$txtPrevCmd.BorderStyle = 'None'
+$txtPrevCmd.BackColor = $script:Th.Panel
+$txtPrevCmd.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 212)
+$txtPrevCmd.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+$sep.BackColor = $script:Th.Line
 $pnlStatus.BackColor = $script:Th.Panel
 $status.BackColor = $script:Th.Panel
-Style-PrimaryButton $btnExport
-# tasto Riavvia Steam: blu con il logo di Steam
-if ($btnSteam.Tag -is [hashtable]) {
-    $btnSteam.Tag.RFill = [System.Drawing.Color]::FromArgb(28, 100, 180)
-    $btnSteam.Tag.RHover = [System.Drawing.Color]::FromArgb(46, 128, 220)
-    $btnSteam.Tag.RBorder = [System.Drawing.Color]::FromArgb(90, 160, 235)
-    $btnSteam.Tag.RText = [System.Drawing.Color]::White
-    try {
-        $sIco = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $steamPath 'steam.exe')).ToBitmap()
-        $small = New-Object System.Drawing.Bitmap(18, 18)
-        $gg = [System.Drawing.Graphics]::FromImage($small)
-        $gg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $gg.DrawImage($sIco, 0, 0, 18, 18); $gg.Dispose()
-        $btnSteam.Tag.RImage = $small
-    } catch {}
-    $btnSteam.Invalidate()
-}
+$pnlProg.BackColor = $script:Th.Panel
 $status.ForeColor = $script:Th.Sub
+Style-PrimaryButton $btnExport
+$btnExport.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10.5)
+if ($btnExport.Tag -is [hashtable]) { $btnExport.Tag.Radius = 10 }
+# pulsanti secondari "ghost": bordo sottile, si accendono al passaggio del mouse
+foreach ($b in $script:BarButtons) {
+    if ($b.Tag -isnot [hashtable]) { continue }
+    $b.Tag.RFill = $script:Th.Bg
+    $b.Tag.RHover = $script:Th.BtnBg
+    $b.Tag.RBorder = $script:Th.Line
+    $b.Tag.Radius = 8
+    $code = [int]$b.AccessibleDescription
+    if ($code) { $b.Tag.RImage = New-GlyphImage $code ([System.Drawing.Color]::FromArgb(196, 160, 255)) }
+}
+try {
+    $sIco = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $steamPath 'steam.exe')).ToBitmap()
+    $small = New-Object System.Drawing.Bitmap(16, 16)
+    $gg = [System.Drawing.Graphics]::FromImage($small)
+    $gg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $gg.DrawImage($sIco, 0, 0, 16, 16); $gg.Dispose()
+    $btnSteam.Tag.RImage = $small
+} catch {}
 Hide-ComboArrow $cmbAcc
 Add-HeaderBar $form 'SteamImporter'
 Add-LangSwitch $form
 Set-AppIcon $form
 Set-DarkTitleBar $form
-Set-DarkListHeader $list
+Set-DarkListHeader $list $script:PaintCell
+Apply-Language
 $form.Add_Shown({ Set-DarkTitleBar $form; Update-LastColumn $list })
 $form.Add_ResizeEnd({ Update-LastColumn $list })
-$form.Add_Shown({ [SINative]::SendMessage($txtFilter.Handle, 0x1501, [IntPtr]1, (T 'cerca...')) | Out-Null; Reload-Apps })
+$form.Add_Shown({ Reload-Apps; $coverTimer.Start() })
 [void]$form.ShowDialog()
+$coverTimer.Stop()
